@@ -1,4 +1,4 @@
-APP = 01_version
+APP = 03_draw
 ZIG ?= /home/tomas/Applications/zig-x86_64-linux-0.17.0-dev.56+a8226cd53/zig
 
 .PHONY: build build-release run

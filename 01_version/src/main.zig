@@ -94,16 +94,13 @@ fn printGpuLine(index: usize, name: []const u8, props: vk.PhysicalDeviceProperti
 
     if (parts.variant == 0) {
         std.debug.print(
-            "GPU {d}: {s}, API {d}.{d}.{d}, driver={d}, vendor={d}, device={d}\n",
+            "GPU {d}: {s}, API {d}.{d}.{d}\n",
             .{
                 index,
                 name,
                 parts.major,
                 parts.minor,
                 parts.patch,
-                props.driver_version,
-                props.vendor_id,
-                props.device_id,
             },
         );
         return;
