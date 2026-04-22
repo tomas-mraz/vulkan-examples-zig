@@ -1,19 +1,20 @@
 const ash = @import("ash");
 const std = @import("std");
+const zgltf = @import("zgltf");
 const vk = ash.vk;
-
 const math = ash.math;
 
 const vert_spv align(@alignOf(u32)) = @embedFile("vertex_shader").*;
 const frag_spv align(@alignOf(u32)) = @embedFile("fragment_shader").*;
+const model_gltf_bytes align(4) = @embedFile("model_gltf").*;
 
-const depth_format: vk.Format = .d16_unorm;
-const texture_path = "textures/gopher.png";
+const depth_format: vk.Format = .d32_sfloat;
+const floats_per_vertex: usize = 6;
+const vertex_stride_bytes: u32 = floats_per_vertex * @sizeOf(f32);
 
 const UniformData = extern struct {
     mvp: math.Mat4,
-    position: [36][4]f32,
-    attr: [36][4]f32,
+    model: math.Mat4,
 };
 
 const UniformBuffers = struct {
@@ -36,8 +37,7 @@ const UniformBuffers = struct {
         errdefer self.deinit(manager.device.?);
 
         const device = manager.device orelse return error.DeviceNotInitialized;
-        for (self.buffers, self.memories, self.mapped, 0..) |*buffer, *memory, *mapped, i| {
-            _ = i;
+        for (self.buffers, self.memories, self.mapped) |*buffer, *memory, *mapped| {
             buffer.* = try device.createBuffer(&.{
                 .size = @sizeOf(UniformData),
                 .usage = .{ .uniform_buffer_bit = true },
@@ -103,10 +103,40 @@ const DescriptorInfo = struct {
     }
 };
 
-pub const CubeRenderer = struct {
+const BufferResource = struct {
+    buffer: vk.Buffer = .null_handle,
+    memory: vk.DeviceMemory = .null_handle,
+
+    fn deinit(self: *BufferResource, device: vk.DeviceProxy) void {
+        if (self.buffer != .null_handle) {
+            device.destroyBuffer(self.buffer, null);
+            self.buffer = .null_handle;
+        }
+        if (self.memory != .null_handle) {
+            device.freeMemory(self.memory, null);
+            self.memory = .null_handle;
+        }
+    }
+};
+
+const ModelData = struct {
+    allocator: std.mem.Allocator,
+    vertices: []f32,
+    indices: []u32,
+
+    fn deinit(self: *ModelData) void {
+        self.allocator.free(self.vertices);
+        self.allocator.free(self.indices);
+    }
+};
+
+pub const ModelRenderer = struct {
     allocator: std.mem.Allocator,
     device: ?vk.DeviceProxy = null,
-    texture: ash.ImageResource = .{},
+
+    model: ?ModelData = null,
+    vertex_buffer: BufferResource = .{},
+    index_buffer: BufferResource = .{},
     uniforms: ?UniformBuffers = null,
     descriptor: ?DescriptorInfo = null,
 
@@ -119,39 +149,50 @@ pub const CubeRenderer = struct {
     start_time: f64 = 0,
     proj_matrix: math.Mat4 = math.identity(),
     view_matrix: math.Mat4 = math.identity(),
-    model_matrix: math.Mat4 = math.identity(),
 
     once_built: bool = false,
     sized_built: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator) CubeRenderer {
-        return .{
-            .allocator = allocator,
-        };
+    pub fn init(allocator: std.mem.Allocator) ModelRenderer {
+        return .{ .allocator = allocator };
     }
 
-    pub fn createOnce(self: *CubeRenderer, session: *ash.Session) !void {
+    pub fn createOnce(self: *ModelRenderer, session: *ash.Session) !void {
         const manager = &session.manager.?;
         const device = manager.device orelse return error.DeviceNotInitialized;
-        const cmd_ctx = &session.cmd_ctx.?;
         self.device = device;
 
-        self.texture = try ash.createTextureFromFile(
-            self.allocator,
-            manager,
-            cmd_ctx,
-            texture_path,
-            .{},
-        );
-        self.uniforms = try UniformBuffers.init(self.allocator, manager, session.swapchain.?.imageCount());
-        self.descriptor = try createDescriptors(self.allocator, device, self.uniforms.?, self.texture, session.swapchain.?.imageCount());
+        self.model = try loadTeapotModel(self.allocator);
+        std.log.info("loaded model: {} vertices, {} indices", .{
+            self.model.?.vertices.len / floats_per_vertex,
+            self.model.?.indices.len,
+        });
 
-        self.model_matrix = math.identity();
+        self.vertex_buffer = try createHostVisibleBuffer(
+            manager,
+            std.mem.sliceAsBytes(self.model.?.vertices),
+            .{ .vertex_buffer_bit = true },
+        );
+        self.index_buffer = try createHostVisibleBuffer(
+            manager,
+            std.mem.sliceAsBytes(self.model.?.indices),
+            .{ .index_buffer_bit = true },
+        );
+
+        const swap_len = session.swapchain.?.imageCount();
+        self.uniforms = try UniformBuffers.init(self.allocator, manager, swap_len);
+        self.descriptor = try createDescriptors(self.allocator, device, self.uniforms.?, swap_len);
+
+        self.view_matrix = math.lookAt(
+            .{ .x = 0, .y = 3, .z = 8 },
+            .{ .x = 0, .y = 0, .z = 0 },
+            .{ .x = 0, .y = 1, .z = 0 },
+        );
         self.start_time = ash.glfw.getTime();
         self.once_built = true;
     }
 
-    pub fn destroyOnce(self: *CubeRenderer) void {
+    pub fn destroyOnce(self: *ModelRenderer) void {
         if (!self.once_built) {
             return;
         }
@@ -164,12 +205,17 @@ pub const CubeRenderer = struct {
             uniforms.deinit(device);
             self.uniforms = null;
         }
-        self.texture.deinit(device);
+        self.index_buffer.deinit(device);
+        self.vertex_buffer.deinit(device);
+        if (self.model) |*model| {
+            model.deinit();
+            self.model = null;
+        }
         self.device = null;
         self.once_built = false;
     }
 
-    pub fn createSized(self: *CubeRenderer, session: *ash.Session, extent: vk.Extent2D) !void {
+    pub fn createSized(self: *ModelRenderer, session: *ash.Session, extent: vk.Extent2D) !void {
         const manager = &session.manager.?;
         const device = manager.device orelse return error.DeviceNotInitialized;
 
@@ -182,7 +228,7 @@ pub const CubeRenderer = struct {
         self.pipeline_layout = try createPipelineLayout(device, self.descriptor.?.layout);
         errdefer device.destroyPipelineLayout(self.pipeline_layout, null);
 
-        self.pipeline = try createPipeline(device, extent, self.pipeline_layout, self.render_pass);
+        self.pipeline = try createPipeline(device, self.pipeline_layout, self.render_pass);
         errdefer device.destroyPipeline(self.pipeline, null);
 
         self.framebuffers = try createFramebuffers(
@@ -194,18 +240,18 @@ pub const CubeRenderer = struct {
         );
         errdefer destroyFramebuffers(self.allocator, device, self.framebuffers);
 
-        self.view_matrix = math.lookAt(
-            .{ .x = 0, .y = 3, .z = 5 },
-            .{ .x = 0, .y = 0, .z = 0 },
-            .{ .x = 0, .y = 1, .z = 0 },
+        self.proj_matrix = math.perspective(
+            math.degreesToRadians(45.0),
+            @as(f32, @floatFromInt(extent.width)) / @as(f32, @floatFromInt(extent.height)),
+            0.1,
+            100.0,
         );
-        self.proj_matrix = math.perspective(math.degreesToRadians(45.0), @as(f32, @floatFromInt(extent.width)) / @as(f32, @floatFromInt(extent.height)), 0.1, 100.0);
         self.proj_matrix[1][1] *= -1;
 
         self.sized_built = true;
     }
 
-    pub fn destroySized(self: *CubeRenderer) void {
+    pub fn destroySized(self: *ModelRenderer) void {
         if (!self.sized_built) {
             return;
         }
@@ -228,15 +274,18 @@ pub const CubeRenderer = struct {
         self.sized_built = false;
     }
 
-    pub fn draw(self: *CubeRenderer, session: *ash.Session, frame: *const ash.Frame) !void {
+    pub fn draw(self: *ModelRenderer, session: *ash.Session, frame: *const ash.Frame) !void {
         const device = session.manager.?.device orelse return error.DeviceNotInitialized;
 
-        const angle = math.degreesToRadians(@floatCast((ash.glfw.getTime() - self.start_time) * 45.0));
-        self.model_matrix = math.rotateY(&math.identity(), angle);
-        self.writeUniforms(frame.image_index);
+        const elapsed = @as(f32, @floatCast(ash.glfw.getTime() - self.start_time)) * 45.0;
+        const model_matrix = math.rotateY(&math.identity(), math.degreesToRadians(elapsed));
+        const vp = math.multiply(&self.proj_matrix, &self.view_matrix);
+        const mvp = math.multiply(&vp, &model_matrix);
+        const ubo = UniformData{ .mvp = mvp, .model = model_matrix };
+        self.uniforms.?.update(frame.image_index, &ubo);
 
         const clear_values = [_]vk.ClearValue{
-            .{ .color = .{ .float_32 = .{ 0.2, 0.2, 0.2, 1.0 } } },
+            .{ .color = .{ .float_32 = .{ 0.1, 0.1, 0.12, 1.0 } } },
             .{ .depth_stencil = .{ .depth = 1.0, .stencil = 0 } },
         };
 
@@ -274,36 +323,149 @@ pub const CubeRenderer = struct {
             (&self.descriptor.?.sets[@intCast(frame.image_index)])[0..1],
             &.{},
         );
-        device.cmdDraw(frame.cmd, 36, 1, 0, 0);
+        const vertex_buffers = [_]vk.Buffer{self.vertex_buffer.buffer};
+        const offsets = [_]vk.DeviceSize{0};
+        device.cmdBindVertexBuffers(frame.cmd, 0, &vertex_buffers, &offsets);
+        device.cmdBindIndexBuffer(frame.cmd, self.index_buffer.buffer, 0, .uint32);
+        device.cmdDrawIndexed(frame.cmd, @intCast(self.model.?.indices.len), 1, 0, 0, 0);
         device.cmdEndRenderPass(frame.cmd);
     }
-
-    fn writeUniforms(self: *CubeRenderer, index: u32) void {
-        const vp = math.multiply(&self.proj_matrix, &self.view_matrix);
-        const mvp = math.multiply(&vp, &self.model_matrix);
-
-        var data = UniformData{
-            .mvp = mvp,
-            .position = undefined,
-            .attr = undefined,
-        };
-        for (0..36) |i| {
-            data.position[i] = .{
-                vertex_buffer_data[i * 3],
-                vertex_buffer_data[i * 3 + 1],
-                vertex_buffer_data[i * 3 + 2],
-                1.0,
-            };
-            data.attr[i] = .{
-                uv_buffer_data[i * 2],
-                uv_buffer_data[i * 2 + 1],
-                0.0,
-                0.0,
-            };
-        }
-        self.uniforms.?.update(index, &data);
-    }
 };
+
+fn loadTeapotModel(allocator: std.mem.Allocator) !ModelData {
+    var gltf = zgltf.Gltf.init(allocator);
+    defer gltf.deinit();
+
+    try gltf.parse(&model_gltf_bytes);
+
+    if (gltf.data.buffers.len == 0) {
+        return error.GltfMissingBuffer;
+    }
+    const uri = gltf.data.buffers[0].uri orelse return error.GltfMissingBufferUri;
+    const binary = try decodeDataUri(allocator, uri);
+    defer allocator.free(binary);
+
+    if (gltf.data.meshes.len == 0 or gltf.data.meshes[0].primitives.len == 0) {
+        return error.GltfMissingMesh;
+    }
+
+    var vertices = std.ArrayList(f32).empty;
+    errdefer vertices.deinit(allocator);
+    var indices = std.ArrayList(u32).empty;
+    errdefer indices.deinit(allocator);
+
+    for (gltf.data.meshes) |mesh| {
+        for (mesh.primitives) |primitive| {
+            const vertex_offset: u32 = @intCast(vertices.items.len / floats_per_vertex);
+
+            var position_index: ?usize = null;
+            var normal_index: ?usize = null;
+            for (primitive.attributes) |attribute| {
+                switch (attribute) {
+                    .position => |idx| position_index = idx,
+                    .normal => |idx| normal_index = idx,
+                    else => {},
+                }
+            }
+            const pos_idx = position_index orelse return error.GltfMissingPositions;
+            const norm_idx = normal_index orelse return error.GltfMissingNormals;
+
+            const pos_accessor = gltf.data.accessors[pos_idx];
+            const norm_accessor = gltf.data.accessors[norm_idx];
+            if (pos_accessor.count != norm_accessor.count) {
+                return error.GltfVertexAttributeMismatch;
+            }
+
+            const vertex_count = pos_accessor.count;
+            try vertices.ensureUnusedCapacity(allocator, vertex_count * floats_per_vertex);
+
+            var pos_it = pos_accessor.iterator(f32, &gltf, binary);
+            var norm_it = norm_accessor.iterator(f32, &gltf, binary);
+            var i: usize = 0;
+            while (i < vertex_count) : (i += 1) {
+                const p = pos_it.next() orelse return error.GltfPositionShort;
+                const n = norm_it.next() orelse return error.GltfNormalShort;
+                vertices.appendSliceAssumeCapacity(&.{
+                    p[0], p[1], p[2],
+                    n[0], n[1], n[2],
+                });
+            }
+
+            const indices_accessor_index = primitive.indices orelse return error.GltfMissingIndices;
+            const indices_accessor = gltf.data.accessors[indices_accessor_index];
+            try indices.ensureUnusedCapacity(allocator, indices_accessor.count);
+            switch (indices_accessor.component_type) {
+                .unsigned_short => {
+                    var it = indices_accessor.iterator(u16, &gltf, binary);
+                    while (it.next()) |slice| {
+                        indices.appendAssumeCapacity(@as(u32, slice[0]) + vertex_offset);
+                    }
+                },
+                .unsigned_integer => {
+                    var it = indices_accessor.iterator(u32, &gltf, binary);
+                    while (it.next()) |slice| {
+                        indices.appendAssumeCapacity(slice[0] + vertex_offset);
+                    }
+                },
+                .unsigned_byte => {
+                    var it = indices_accessor.iterator(u8, &gltf, binary);
+                    while (it.next()) |slice| {
+                        indices.appendAssumeCapacity(@as(u32, slice[0]) + vertex_offset);
+                    }
+                },
+                else => return error.GltfUnsupportedIndexType,
+            }
+        }
+    }
+
+    return .{
+        .allocator = allocator,
+        .vertices = try vertices.toOwnedSlice(allocator),
+        .indices = try indices.toOwnedSlice(allocator),
+    };
+}
+
+fn decodeDataUri(allocator: std.mem.Allocator, uri: []const u8) ![]align(4) const u8 {
+    const prefix = "data:application/octet-stream;base64,";
+    if (!std.mem.startsWith(u8, uri, prefix)) {
+        return error.UnsupportedBufferUri;
+    }
+    const encoded = uri[prefix.len..];
+    const decoder = std.base64.standard.Decoder;
+    const decoded_len = try decoder.calcSizeForSlice(encoded);
+    const out = try allocator.alignedAlloc(u8, .of(f32), decoded_len);
+    errdefer allocator.free(out);
+    try decoder.decode(out, encoded);
+    return out;
+}
+
+fn createHostVisibleBuffer(
+    manager: *const ash.Manager,
+    data: []const u8,
+    usage: vk.BufferUsageFlags,
+) !BufferResource {
+    const device = manager.device orelse return error.DeviceNotInitialized;
+    var result = BufferResource{};
+    errdefer result.deinit(device);
+
+    result.buffer = try device.createBuffer(&.{
+        .size = data.len,
+        .usage = usage,
+        .sharing_mode = .exclusive,
+    }, null);
+    const requirements = device.getBufferMemoryRequirements(result.buffer);
+    result.memory = try manager.allocate(requirements, .{
+        .host_visible_bit = true,
+        .host_coherent_bit = true,
+    });
+    try device.bindBufferMemory(result.buffer, result.memory, 0);
+
+    const mapped = try device.mapMemory(result.memory, 0, vk.WHOLE_SIZE, .{});
+    defer device.unmapMemory(result.memory);
+    @memcpy((@as([*]u8, @ptrCast(@alignCast(mapped))))[0..data.len], data);
+
+    return result;
+}
 
 fn createDepthImage(manager: *const ash.Manager, width: u32, height: u32) !ash.ImageResource {
     const device = manager.device orelse return error.DeviceNotInitialized;
@@ -353,7 +515,6 @@ fn createDescriptors(
     allocator: std.mem.Allocator,
     device: vk.DeviceProxy,
     uniforms: UniformBuffers,
-    texture: ash.ImageResource,
     set_count: usize,
 ) !DescriptorInfo {
     var descriptor = DescriptorInfo{
@@ -369,12 +530,6 @@ fn createDescriptors(
             .descriptor_count = 1,
             .stage_flags = .{ .vertex_bit = true },
         },
-        .{
-            .binding = 1,
-            .descriptor_type = .combined_image_sampler,
-            .descriptor_count = 1,
-            .stage_flags = .{ .fragment_bit = true },
-        },
     };
     descriptor.layout = try device.createDescriptorSetLayout(&.{
         .binding_count = bindings.len,
@@ -383,7 +538,6 @@ fn createDescriptors(
 
     const pool_sizes = [_]vk.DescriptorPoolSize{
         .{ .type = .uniform_buffer, .descriptor_count = @intCast(set_count) },
-        .{ .type = .combined_image_sampler, .descriptor_count = @intCast(set_count) },
     };
     descriptor.pool = try device.createDescriptorPool(&.{
         .max_sets = @intCast(set_count),
@@ -408,11 +562,6 @@ fn createDescriptors(
             .offset = 0,
             .range = @sizeOf(UniformData),
         };
-        const image_info = vk.DescriptorImageInfo{
-            .sampler = texture.sampler,
-            .image_view = texture.view,
-            .image_layout = .shader_read_only_optimal,
-        };
         const writes = [_]vk.WriteDescriptorSet{
             .{
                 .dst_set = set,
@@ -422,16 +571,6 @@ fn createDescriptors(
                 .descriptor_type = .uniform_buffer,
                 .p_buffer_info = @ptrCast(&buffer_info),
                 .p_image_info = undefined,
-                .p_texel_buffer_view = undefined,
-            },
-            .{
-                .dst_set = set,
-                .dst_binding = 1,
-                .dst_array_element = 0,
-                .descriptor_count = 1,
-                .descriptor_type = .combined_image_sampler,
-                .p_buffer_info = undefined,
-                .p_image_info = @ptrCast(&image_info),
                 .p_texel_buffer_view = undefined,
             },
         };
@@ -497,7 +636,6 @@ fn createPipelineLayout(device: vk.DeviceProxy, descriptor_set_layout: vk.Descri
 
 fn createPipeline(
     device: vk.DeviceProxy,
-    extent: vk.Extent2D,
     pipeline_layout: vk.PipelineLayout,
     render_pass: vk.RenderPass,
 ) !vk.Pipeline {
@@ -518,11 +656,20 @@ fn createPipeline(
         .{ .stage = .{ .fragment_bit = true }, .module = frag, .p_name = "main" },
     };
 
+    const binding_description = vk.VertexInputBindingDescription{
+        .binding = 0,
+        .stride = vertex_stride_bytes,
+        .input_rate = .vertex,
+    };
+    const attribute_descriptions = [_]vk.VertexInputAttributeDescription{
+        .{ .binding = 0, .location = 0, .format = .r32g32b32_sfloat, .offset = 0 },
+        .{ .binding = 0, .location = 1, .format = .r32g32b32_sfloat, .offset = 3 * @sizeOf(f32) },
+    };
     const vertex_input = vk.PipelineVertexInputStateCreateInfo{
-        .vertex_binding_description_count = 0,
-        .p_vertex_binding_descriptions = null,
-        .vertex_attribute_description_count = 0,
-        .p_vertex_attribute_descriptions = null,
+        .vertex_binding_description_count = 1,
+        .p_vertex_binding_descriptions = @ptrCast(&binding_description),
+        .vertex_attribute_description_count = attribute_descriptions.len,
+        .p_vertex_attribute_descriptions = &attribute_descriptions,
     };
     const input_assembly = vk.PipelineInputAssemblyStateCreateInfo{
         .topology = .triangle_list,
@@ -539,7 +686,7 @@ fn createPipeline(
         .rasterizer_discard_enable = .false,
         .polygon_mode = .fill,
         .cull_mode = .{},
-        .front_face = .clockwise,
+        .front_face = .counter_clockwise,
         .depth_bias_enable = .false,
         .depth_bias_constant_factor = 0,
         .depth_bias_clamp = 0,
@@ -604,7 +751,6 @@ fn createPipeline(
         .p_dynamic_states = &dynamic_states,
     };
 
-    _ = extent;
     const pipeline_info = vk.GraphicsPipelineCreateInfo{
         .stage_count = shader_stages.len,
         .p_stages = &shader_stages,
@@ -668,21 +814,3 @@ fn destroyFramebuffers(allocator: std.mem.Allocator, device: vk.DeviceProxy, fra
     }
     allocator.free(framebuffers);
 }
-
-const vertex_buffer_data = [_]f32{
-    -1, -1, -1, -1, -1, 1,  -1, 1,  1,  -1, 1,  1,  -1, 1,  -1, -1, -1, -1,
-    -1, -1, -1, 1,  1,  -1, 1,  -1, -1, -1, -1, -1, -1, 1,  -1, 1,  1,  -1,
-    -1, -1, -1, 1,  -1, -1, 1,  -1, 1,  -1, -1, -1, 1,  -1, 1,  -1, -1, 1,
-    -1, 1,  -1, -1, 1,  1,  1,  1,  1,  -1, 1,  -1, 1,  1,  1,  1,  1,  -1,
-    1,  1,  -1, 1,  1,  1,  1,  -1, 1,  1,  -1, 1,  1,  -1, -1, 1,  1,  -1,
-    -1, 1,  1,  -1, -1, 1,  1,  1,  1,  -1, -1, 1,  1,  -1, 1,  1,  1,  1,
-};
-
-const uv_buffer_data = [_]f32{
-    0, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 1,
-    1, 1, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0,
-    1, 0, 1, 1, 0, 1, 1, 0, 0, 1, 0, 0,
-    1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1,
-    1, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 0,
-    0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 0,
-};
