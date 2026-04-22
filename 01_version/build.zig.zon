@@ -1,0 +1,17 @@
+.{
+    .name = .example_01_version,
+    .fingerprint = 0x15c9958a9a6e6e13,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.17.0-dev.56+a8226cd53",
+    .dependencies = .{
+        .vulkan_zig = .{
+            .url = "git+https://github.com/tomas-mraz/vulkan-zig#6d77ac2a9b25c8940d493b2f7739c639c4842482",
+            .hash = "vulkan-0.0.0-r7Ytx7l9AwCsebml5bToJyyr67VASs0-7UszmWKVXNb7",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
