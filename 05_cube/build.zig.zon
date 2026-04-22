@@ -1,0 +1,20 @@
+.{
+    .name = .example_05_cube,
+    .fingerprint = 0xe2e2adbf10612ed7,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.17.0-dev.56+a8226cd53",
+    .dependencies = .{
+        .vulkan_ash = .{
+            .path = "../../vulkan-ash",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "README.md",
+        "src",
+        "shaders",
+        "textures",
+        "Makefile",
+    },
+}
