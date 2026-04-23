@@ -1,0 +1,23 @@
+.{
+    .name = .example_07_model_textured,
+    .fingerprint = 0xd44ed445aa82361f,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.17.0-dev.56+a8226cd53",
+    .dependencies = .{
+        .vulkan_ash = .{
+            .path = "../../vulkan-ash",
+        },
+        .zgltf = .{
+            .url = "git+https://github.com/kooparse/zgltf#ec52d477db346af99d4cdced4e35e67e1670023f",
+            .hash = "zgltf-0.1.0-sX6QAt0SAgDzMQCCG-N181hVbx8JnwFYZ3luQigQpVBM",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "shaders",
+        "DiffuseTransmissionTeacup.glb",
+        "Makefile",
+    },
+}
