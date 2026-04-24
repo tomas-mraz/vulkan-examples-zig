@@ -4,6 +4,7 @@ layout (location = 0) in vec3 inPosition;
 
 layout (push_constant) uniform PushConstants {
     float angle;
+    vec2 offset;
 } pc;
 
 void main() {
@@ -11,5 +12,6 @@ void main() {
     float s = sin(pc.angle);
     mat2 rot = mat2(c, s, -s, c);
     vec2 rotated = rot * inPosition.xy;
-    gl_Position = vec4(rotated, inPosition.z, 1.0);
+    vec2 translated = rotated + pc.offset;
+    gl_Position = vec4(translated, inPosition.z, 1.0);
 }

@@ -19,7 +19,7 @@ Conersion PNG image into RGBA format, compatible with Vulkan Image object, using
 | 01 | `01_version`        | Print Vulkan API and loader version                                                        |
 | 02 | `02_info`           | Print GPU properties, extensions, layers                                                   |
 | 03 | `03_draw`           | Static red triangle (pre-recorded command buffers)                                         |
-| 04 | `04_triangle`       | Rotating blue triangle (push constants)                                                    |
+| 04 | `04_triangle`       | Rotating yellow triangle (push constants)                                                  |
 | 05 | `05_cube`           | Textured rotating cube with gopher texture (uniform buffer, depth buffer, descriptor sets) |
 | 06 | `06_model`          | Rotating 3D teapot model from glTF file (indexed drawing, depth buffer, directional light) |
 | 07 | `07_model_textured` | Rotating textured teacup from GLB file (texture sampling, indexed drawing, depth buffer)   |
@@ -69,6 +69,16 @@ To see available targets:
 ```bash
 make help
 ```
+
+
+# Troubles
+
+- GLFW občas namísto repeat vrátí `release` a pak `press` což způsobuje zaškobrtnutí
+  - udržování stavu pohybu namísto spoléhání na `repeat`
+  - 40ms grace period pro vyhlazení pohybu
+
+- Wayland občas misne vblank a frame se zobrazí až jako další, mezera mezi frames není 16ms ale 33ms
+  - delta_time pro výpočet pohybu se capuje na 1/60 vteřiny
 
 
 # Dependencies
