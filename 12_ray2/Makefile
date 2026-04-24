@@ -5,6 +5,9 @@ APP = 12_ray2
 build:
 	zig build
 
+build-release:
+	zig build -Doptimize=ReleaseSafe
+
 run:
 	zig build run
 

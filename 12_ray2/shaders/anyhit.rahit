@@ -12,7 +12,9 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
-layout(location = 3) rayPayloadInEXT uint payloadSeed;
+#include "payload.glsl"
+
+layout(location = 0) rayPayloadInEXT Payload payload;
 
 hitAttributeEXT vec2 attribs;
 
@@ -23,6 +25,8 @@ struct GeometryNode {
 	uint64_t indexBufferDeviceAddress;
 	int textureIndexBaseColor;
 	int textureIndexOcclusion;
+	uint isGlass;
+	uint _padding;
 };
 layout(binding = 4, set = 0) buffer GeometryNodes { GeometryNode nodes[]; } geometryNodes;
 
@@ -34,13 +38,33 @@ layout(binding = 5, set = 0) uniform sampler2D textures[];
 
 void main()
 {
-	Triangle tri = unpackTriangle(gl_PrimitiveID);
 	GeometryNode geometryNode = geometryNodes.nodes[gl_GeometryIndexEXT];
+
+	if (geometryNode.isGlass != 0u) {
+		// Deterministic alpha-compositing accumulation: each glass surface contributes
+		// GLASS_OPACITY on top of whatever coverage was already accumulated.
+		payload.glassCoverage = 1.0 - (1.0 - payload.glassCoverage) * (1.0 - GLASS_OPACITY);
+
+		if ((payload.flags & PAYLOAD_FLAG_SKIP_GLASS_RECORD) == 0u) {
+			// Record the nearest glass intersection so raygen can spawn a reflection ray.
+			// Any-hit is invoked in arbitrary order, so keep the closest one.
+			if (payload.glassFirstT < 0.0 || gl_HitTEXT < payload.glassFirstT) {
+				Triangle tri = unpackTriangle(gl_PrimitiveID);
+				vec3 worldNormal = normalize(mat3(gl_ObjectToWorldEXT) * tri.normal);
+				payload.glassFirstT = gl_HitTEXT;
+				payload.glassFirstNormal = worldNormal;
+			}
+		}
+
+		ignoreIntersectionEXT;
+	}
+
+	Triangle tri = unpackTriangle(gl_PrimitiveID);
 	vec4 color = texture(textures[nonuniformEXT(geometryNode.textureIndexBaseColor)], tri.uv);
-	// If the alpha value of the texture at the current UV coordinates is below a given threshold, we'll ignore this intersection
-	// That way ray traversal will be stopped and the miss shader will be invoked
+	// Alpha-cutout: probabilistically skip hits with low alpha. Intentionally stochastic
+	// so partial transparency averages across samples (unused by this model but kept intact).
 	if (color.a < 0.9) {
-		if(rnd(payloadSeed) > color.a) {
+		if (rnd(payload.seed) > color.a) {
 			ignoreIntersectionEXT;
 		}
 	}

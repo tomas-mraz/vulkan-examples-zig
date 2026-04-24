@@ -28,7 +28,14 @@ const GeometryNode = extern struct {
     index_device_address: u64,
     texture_index_base_color: i32,
     texture_index_occlusion: i32,
+    is_glass: u32,
+    _padding: u32 = 0,
 };
+
+// Per-surface glass opacity — kept in sync with GLASS_OPACITY in shaders/payload.glsl.
+// Transparency is applied deterministically in any-hit (coverage accumulator) plus tint in raygen,
+// so there is no stochastic noise at the glass surfaces regardless of sample count.
+const glass_opacity: f32 = 0.5;
 
 const Buffer = struct {
     buffer: vk.Buffer = .null_handle,
@@ -96,6 +103,7 @@ const Primitive = struct {
     transform: [12]f32 = .{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 },
     base_color_tex: i32 = 0,
     occlusion_tex: i32 = -1,
+    is_glass: bool = false,
 };
 
 pub const Ray2Renderer = struct {
@@ -492,6 +500,11 @@ pub const Ray2Renderer = struct {
                 if (mat.occlusion_texture) |occ| {
                     primitive.occlusion_tex = @intCast(@as(u32, @intCast(occ.index)) + 1);
                 }
+                if (mat.name) |n| {
+                    // FlightHelmet: "LensesMat" are the transparent visor lenses.
+                    // "GlassPlasticMat" is the opaque plastic frame around them — do not match.
+                    primitive.is_glass = std.ascii.indexOfIgnoreCase(n, "lens") != null;
+                }
             }
         }
 
@@ -712,7 +725,8 @@ pub const Ray2Renderer = struct {
             geometries[i] = .{
                 .geometry_type = .triangles_khr,
                 .geometry = .{ .triangles = triangles },
-                .flags = .{ .opaque_bit_khr = true },
+                // Glass primitives must NOT be opaque — any-hit shader handles stochastic transparency.
+                .flags = .{ .opaque_bit_khr = !p.is_glass, .no_duplicate_any_hit_invocation_bit_khr = p.is_glass },
             };
             primitive_counts[i] = p.triangle_count;
             ranges[i] = .{
@@ -797,6 +811,7 @@ pub const Ray2Renderer = struct {
                 .index_device_address = p.index_buf.device_address,
                 .texture_index_base_color = p.base_color_tex,
                 .texture_index_occlusion = p.occlusion_tex,
+                .is_glass = if (p.is_glass) 1 else 0,
             };
         }
         self.geometry_nodes_buf = try self.createBufferHostVisible(

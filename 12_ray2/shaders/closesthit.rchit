@@ -13,7 +13,9 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
-layout(location = 0) rayPayloadInEXT vec3 hitValue;
+#include "payload.glsl"
+
+layout(location = 0) rayPayloadInEXT Payload payload;
 layout(location = 2) rayPayloadEXT bool shadowed;
 hitAttributeEXT vec2 attribs;
 
@@ -25,6 +27,8 @@ struct GeometryNode {
 	uint64_t indexBufferDeviceAddress;
 	int textureIndexBaseColor;
 	int textureIndexOcclusion;
+	uint isGlass;
+	uint _padding;
 };
 layout(binding = 4, set = 0) buffer GeometryNodes { GeometryNode nodes[]; } geometryNodes;
 
@@ -36,8 +40,6 @@ layout(binding = 5, set = 0) uniform sampler2D textures[];
 void main()
 {
 	Triangle tri = unpackTriangle(gl_PrimitiveID);
-	hitValue = vec3(tri.normal);
-
 	GeometryNode geometryNode = geometryNodes.nodes[gl_GeometryIndexEXT];
 
 	vec3 color = texture(textures[nonuniformEXT(geometryNode.textureIndexBaseColor)], tri.uv).rgb;
@@ -46,18 +48,18 @@ void main()
 		color *= occlusion;
 	}
 
-	hitValue = color;
+	payload.radiance = color;
 
 	// Shadow casting
 	float tmin = 0.001;
 	float tmax = 10000.0;
 	float epsilon = 0.001;
 	vec3 origin = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT + tri.normal * epsilon;
-	shadowed = true;  
+	shadowed = true;
 	vec3 lightVector = vec3(-5.0, -2.5, -5.0);
 	// Trace shadow ray and offset indices to match shadow hit/miss shader group indices
 //	traceRayEXT(topLevelAS, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT, 0xFF, 0, 0, 1, origin, tmin, lightVector, tmax, 2);
 //	if (shadowed) {
-//		hitValue *= 0.7;
+//		payload.radiance *= 0.7;
 //	}
 }
