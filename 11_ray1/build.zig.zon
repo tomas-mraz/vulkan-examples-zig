@@ -1,0 +1,18 @@
+.{
+    .name = .example_11_ray1,
+    .fingerprint = 0xe9be813cd7564234,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.17.0-dev.56+a8226cd53",
+    .dependencies = .{
+        .vulkan_ash = .{
+            .path = "../../vulkan-ash",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "shaders",
+        "Makefile",
+    },
+}
