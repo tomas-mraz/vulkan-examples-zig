@@ -38,7 +38,7 @@ Conersion PNG image into RGBA format, compatible with Vulkan Image object, using
 
 Required 64bit operating system:
 - Windows 10/11
-- Linux with Wayland
+- Linux with Wayland (Gnome 50+)
 - macOS 17+ with Metal 4
 
 ## macOS
@@ -59,6 +59,8 @@ To support raytracing examples is needed hardware with one of theese chips:
 
 
 # Build
+
+Using llvm backend  for normal debug build because it is more stable than Zig one.
 
 Each example has its own `Makefile`. To build and run in the project folder:
 ```bash
@@ -102,7 +104,8 @@ make help
 # Related projects
 - Sascha Willems Vulkan Examples in C++ https://github.com/SaschaWillems/Vulkan
 - Official Khronos Group Vulkan Examples https://github.com/KhronosGroup/Vulkan-Samples
-
+- AMD GPUOpen - https://gpuopen.com
+- Zig - https://ziglang.org/ - https://codeberg.org/ziglang/zig/issues
 
 # Assets and licences
 

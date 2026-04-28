@@ -2,12 +2,7 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    // Debug currently crashes the Zig 0.17-dev compiler for this dependency mix.
-    const optimize = b.option(
-        std.builtin.OptimizeMode,
-        "optimize",
-        "Prioritize performance, safety, or binary size",
-    ) orelse .ReleaseSafe;
+    const optimize = b.standardOptimizeOption(.{});
 
     const ash_dep = b.dependency("vulkan_ash", .{
         .target = target,
@@ -16,6 +11,7 @@ pub fn build(b: *std.Build) void {
 
     const exe = b.addExecutable(.{
         .name = "05_cube",
+        .use_llvm = true,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
