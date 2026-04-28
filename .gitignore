@@ -1,16 +1,35 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.spv
+*.apk
+
 # Zig
 .zig-cache/
 zig-out/
 *.o
 **/zig-pkg
 
+# Gradle wrapper
+**/.gradle
+**/.gradle-user-home
+gradle-daemon-jvm.properties
+
+# Android
+**/android/app/build
+**/android/build
+**/android/local.properties
+
+# Editor/IDE
+.idea/
+.vscode/
+
 # AI agents
 .claude
 CLAUDE.md
-AI.txt
-
-# IDEs
-.idea
 
 # binaries
 01_version/01_version
