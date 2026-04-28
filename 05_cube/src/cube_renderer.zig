@@ -194,13 +194,24 @@ pub const CubeRenderer = struct {
         );
         errdefer destroyFramebuffers(self.allocator, device, self.framebuffers);
 
+        // Camera + projection — kept in sync with the Go reference
+        // (vulkan-examples-go/05_cube). Two extent-driven adjustments:
+        //   1. portrait dolly: at aspect < 1 the horizontal FOV gets too narrow
+        //      for a 2x2x2 cube, so we pull the camera back by 1/aspect.
+        //   2. preTransform: the surface rotation is folded into the projection
+        //      so the Android compositor doesn't rotate the framebuffer.
+        const aspect = @as(f32, @floatFromInt(extent.width)) / @as(f32, @floatFromInt(extent.height));
+        const scale: f32 = if (aspect < 1.0) 1.0 / aspect else 1.0;
         self.view_matrix = math.lookAt(
-            .{ .x = 0, .y = 3, .z = 5 },
+            .{ .x = 0, .y = 3 * scale, .z = 5 * scale },
             .{ .x = 0, .y = 0, .z = 0 },
             .{ .x = 0, .y = 1, .z = 0 },
         );
-        self.proj_matrix = math.perspective(math.degreesToRadians(45.0), @as(f32, @floatFromInt(extent.width)) / @as(f32, @floatFromInt(extent.height)), 0.1, 100.0);
-        self.proj_matrix[1][1] *= -1;
+
+        var proj = math.perspective(math.degreesToRadians(45.0), aspect, 0.1, 100.0);
+        proj[1][1] *= -1;
+        const pre_rot = session.swapchain.?.preRotationMatrix();
+        self.proj_matrix = math.multiply(&pre_rot, &proj);
 
         self.sized_built = true;
     }

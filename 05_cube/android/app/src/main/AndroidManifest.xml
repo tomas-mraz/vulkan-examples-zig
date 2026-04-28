@@ -10,7 +10,7 @@
         <activity
             android:name="android.app.NativeActivity"
             android:label="VulkanCube"
-            android:configChanges="orientation|keyboardHidden|screenSize"
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|density|uiMode"
             android:exported="true">
 
             <meta-data
