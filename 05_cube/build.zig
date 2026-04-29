@@ -83,6 +83,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = frag_spv,
     });
 
+    compile.root_module.addAnonymousImport("texture_gopher", .{
+        .root_source_file = b.path("textures/gopher.png"),
+    });
+
     b.installArtifact(compile);
 
     if (!is_android) {

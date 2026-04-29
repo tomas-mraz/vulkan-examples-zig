@@ -6,9 +6,9 @@ const math = ash.math;
 
 const vert_spv align(@alignOf(u32)) = @embedFile("vertex_shader").*;
 const frag_spv align(@alignOf(u32)) = @embedFile("fragment_shader").*;
+const gopher_png = @embedFile("texture_gopher").*;
 
 const depth_format: vk.Format = .d16_unorm;
-const texture_path = "textures/gopher.png";
 
 const UniformData = extern struct {
     mvp: math.Mat4,
@@ -136,15 +136,13 @@ pub const CubeRenderer = struct {
         const cmd_ctx = &session.cmd_ctx.?;
         self.device = device;
 
-        self.texture = try ash.createTextureFromFile(
+        self.texture = try ash.createTextureFromEncoded(
             self.allocator,
             manager,
             cmd_ctx,
-            texture_path,
+            &gopher_png,
             .{},
         );
-        self.uniforms = try UniformBuffers.init(self.allocator, manager, session.swapchain.?.imageCount());
-        self.descriptor = try createDescriptors(self.allocator, device, self.uniforms.?, self.texture, session.swapchain.?.imageCount());
 
         self.model_matrix = math.identity();
         self.start_time = ash.glfw.getTime();
@@ -156,14 +154,6 @@ pub const CubeRenderer = struct {
             return;
         }
         const device = self.device orelse return;
-        if (self.descriptor) |*descriptor| {
-            descriptor.deinit(device);
-            self.descriptor = null;
-        }
-        if (self.uniforms) |*uniforms| {
-            uniforms.deinit(device);
-            self.uniforms = null;
-        }
         self.texture.deinit(device);
         self.device = null;
         self.once_built = false;
@@ -172,6 +162,13 @@ pub const CubeRenderer = struct {
     pub fn createSized(self: *CubeRenderer, session: *ash.Session, extent: vk.Extent2D) !void {
         const manager = &session.manager.?;
         const device = manager.device orelse return error.DeviceNotInitialized;
+        const image_count = session.swapchain.?.imageCount();
+
+        self.uniforms = try UniformBuffers.init(self.allocator, manager, image_count);
+        errdefer if (self.uniforms) |*u| u.deinit(device);
+
+        self.descriptor = try createDescriptors(self.allocator, device, self.uniforms.?, self.texture, image_count);
+        errdefer if (self.descriptor) |*d| d.deinit(device);
 
         self.depth = try createDepthImage(manager, extent.width, extent.height);
         errdefer self.depth.deinit(device);
@@ -236,6 +233,14 @@ pub const CubeRenderer = struct {
             self.render_pass = .null_handle;
         }
         self.depth.deinit(device);
+        if (self.descriptor) |*descriptor| {
+            descriptor.deinit(device);
+            self.descriptor = null;
+        }
+        if (self.uniforms) |*uniforms| {
+            uniforms.deinit(device);
+            self.uniforms = null;
+        }
         self.sized_built = false;
     }
 

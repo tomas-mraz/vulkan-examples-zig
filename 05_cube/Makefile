@@ -80,3 +80,12 @@ build-macos-release:
 
 clean-macos:
 	rm -f $(APP)-macos-arm64
+
+android-install:
+	adb install 05_cube-arm64-debug.apk
+
+android-remove:
+	adb uninstall com.vulkanexamples.zigcube || true
+
+android-run:
+	adb shell monkey -p com.example.myapp -c android.intent.category.LAUNCHER 1

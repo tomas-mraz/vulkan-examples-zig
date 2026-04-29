@@ -3,11 +3,11 @@ plugins {
 }
 
 android {
-    namespace = "com.vulkanexamples.cube"
+    namespace = "com.vulkanexamples.zigcube"
     compileSdk = 34
 
 	    defaultConfig {
-	        applicationId = "com.vulkanexamples.cube"
+	        applicationId = "com.vulkanexamples.zigcube"
 	        minSdk = 34
 	        targetSdk = 34
 	        versionCode = 1

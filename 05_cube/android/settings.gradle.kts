@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "VulkanCube"
+rootProject.name = "VulkanCube2"
 include(":app")
