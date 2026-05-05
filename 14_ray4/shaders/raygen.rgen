@@ -4,7 +4,7 @@
 
 layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
 layout(binding = 1, set = 0) uniform image2D image;
-layout(binding = 2, set = 0) uniform CameraProperties 
+layout(binding = 2, set = 0) uniform CameraProperties
 {
 	mat4 viewInverse;
 	mat4 projInverse;
@@ -23,10 +23,39 @@ layout(location = 0) rayPayloadEXT RayPayload rayPayload;
 
 layout (constant_id = 0) const int MAX_RECURSION = 4;
 
-void main() 
+// ============================================================
+// SSAA toggle — supersample anti-aliasing.
+// Allowed values: 1, 2, or 4.
+//   1 = off (1 ray/pixel,  baseline cost)
+//   2 = on  2x SSAA (2 rays/pixel, 2x cost)
+//   4 = on  4x SSAA (4 rays/pixel, 4x cost, rotated-grid offsets - smoothest)
+// Anything else trips the #error below.
+// ============================================================
+#define SSAA_SAMPLES 4
+
+#if SSAA_SAMPLES == 4
+// Rotated-grid 4x sub-pixel pattern (positions in [0,1]^2 within a pixel).
+// RGSS gives smoother near-horizontal / near-vertical edges than a 2x2 grid.
+const vec2 ssaaOffsets[4] = vec2[](
+	vec2(0.125, 0.625),
+	vec2(0.375, 0.125),
+	vec2(0.625, 0.875),
+	vec2(0.875, 0.375)
+);
+#elif SSAA_SAMPLES == 2
+const vec2 ssaaOffsets[2] = vec2[](
+	vec2(0.25, 0.75),
+	vec2(0.75, 0.25)
+);
+#elif SSAA_SAMPLES == 1
+const vec2 ssaaOffsets[1] = vec2[](vec2(0.5, 0.5));
+#else
+#error "SSAA_SAMPLES must be 1, 2 or 4"
+#endif
+
+vec3 traceOnePixel(vec2 pixelPos)
 {
-	const vec2 pixelCenter = vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
-	const vec2 inUV = pixelCenter/vec2(gl_LaunchSizeEXT.xy);
+	const vec2 inUV = pixelPos / vec2(gl_LaunchSizeEXT.xy);
 	vec2 d = inUV * 2.0 - 1.0;
 
 	vec4 origin = ubo.viewInverse * vec4(0,0,0,1);
@@ -55,8 +84,19 @@ void main()
 			color += hitColor;
 			break;
 		}
-
 	}
 
-	imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(color, 0.0));
+	return color;
+}
+
+void main()
+{
+	vec3 acc = vec3(0.0);
+	for (int s = 0; s < SSAA_SAMPLES; s++) {
+		const vec2 pixelPos = vec2(gl_LaunchIDEXT.xy) + ssaaOffsets[s];
+		acc += traceOnePixel(pixelPos);
+	}
+	acc *= (1.0 / float(SSAA_SAMPLES));
+
+	imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(acc, 0.0));
 }
