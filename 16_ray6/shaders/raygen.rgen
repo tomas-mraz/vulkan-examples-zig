@@ -25,7 +25,16 @@ struct RayPayload {
 layout(location = 0) rayPayloadEXT RayPayload payload;
 
 const float PI = 3.14159265358979323846;
-const int MAX_BOUNCES = 4;
+const int MAX_BOUNCES = 8;
+const int RR_START_BOUNCE = 3;
+
+// Hardcoded Cornell-box ceiling light. Must match geometry built in
+// ray6_renderer.zig (small emissive quad at y = 0.999).
+const vec3 LIGHT_MIN = vec3(-0.3, 0.999, -0.3);
+const vec3 LIGHT_MAX = vec3( 0.3, 0.999,  0.3);
+const vec3 LIGHT_NORMAL = vec3(0.0, -1.0, 0.0);
+const vec3 LIGHT_EMISSION = vec3(8.0, 8.0, 8.0);
+const float LIGHT_AREA = (LIGHT_MAX.x - LIGHT_MIN.x) * (LIGHT_MAX.z - LIGHT_MIN.z);
 
 // PCG hash, returns uint in [0, 0xFFFFFFFF].
 uint pcg(uint v)
@@ -61,13 +70,35 @@ vec3 cosineHemisphere(vec2 r)
 	return vec3(r1 * cos(phi), r1 * sin(phi), sqrt(max(0.0, 1.0 - r.x)));
 }
 
+// Shadow query: returns true if the segment from `from` along `dir` for
+// `dist` units is unoccluded. Uses the same payload as the path trace —
+// safe because we save the surface state before calling.
+bool visibility(vec3 from, vec3 dir, float dist)
+{
+	payload.t = 1.0; // sentinel; miss shader sets it to -1.0
+	uint flags = gl_RayFlagsOpaqueEXT
+	           | gl_RayFlagsTerminateOnFirstHitEXT
+	           | gl_RayFlagsSkipClosestHitShaderEXT;
+	traceRayEXT(topLevelAS, flags, 0xff, 0, 0, 0, from, 0.001, dir, dist, 0);
+	return payload.t < 0.0;
+}
+
+// Reinhard tone-map + sRGB-ish gamma encoding.
+vec3 toneMap(vec3 hdr)
+{
+	vec3 mapped = hdr / (vec3(1.0) + hdr);
+	return pow(mapped, vec3(1.0 / 2.2));
+}
+
 void main()
 {
-	const vec2 pixelCenter = vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
+	rngState = pcg(gl_LaunchIDEXT.x * 1973u + gl_LaunchIDEXT.y * 9277u + ubo.frameIndex * 26699u + 1u);
+
+	// Pixel jitter for free anti-aliasing through accumulation.
+	const vec2 jitter = vec2(rnd(), rnd());
+	const vec2 pixelCenter = vec2(gl_LaunchIDEXT.xy) + jitter;
 	const vec2 inUV = pixelCenter / vec2(gl_LaunchSizeEXT.xy);
 	vec2 d = inUV * 2.0 - 1.0;
-
-	rngState = pcg(gl_LaunchIDEXT.x * 1973u + gl_LaunchIDEXT.y * 9277u + ubo.frameIndex * 26699u + 1u);
 
 	vec4 origin4 = ubo.viewInverse * vec4(0, 0, 0, 1);
 	vec4 target = ubo.projInverse * vec4(d.x, d.y, 1, 1);
@@ -83,22 +114,68 @@ void main()
 		traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xff, 0, 0, 0, origin, 0.001, direction, 10000.0, 0);
 
 		if (payload.t < 0.0) {
-			// Miss: closed Cornell box, but treat as black.
+			// Miss: closed Cornell box, treat as black.
 			break;
 		}
 
-		if (payload.emission > 0.0) {
-			radiance += throughput * payload.albedo * payload.emission;
-			break;
-		}
-
-		// Diffuse Lambert bounce. Throughput update for cosine-weighted sample
-		// is just albedo (BRDF * cos(theta) / pdf simplifies to albedo).
-		throughput *= payload.albedo;
-
-		vec3 hitPos = origin + direction * payload.t;
-		vec3 n = payload.normal;
+		// Save the surface state — NEE/visibility traces clobber payload.
+		vec3 hitAlbedo = payload.albedo;
+		float hitEmission = payload.emission;
+		vec3 hitNormal = payload.normal;
+		float hitT = payload.t;
+		vec3 hitPos = origin + direction * hitT;
+		vec3 n = hitNormal;
 		if (dot(n, direction) > 0.0) n = -n;
+
+		if (hitEmission > 0.0) {
+			// Direct emission: only counted on the primary ray.
+			// Subsequent bounces would double-count NEE's contribution.
+			if (bounce == 0) {
+				radiance += throughput * hitAlbedo * hitEmission;
+			}
+			break;
+		}
+
+		// --- Next-event estimation: explicit area-light sample ---
+		{
+			vec2 lr = vec2(rnd(), rnd());
+			vec3 lightPos = vec3(
+				mix(LIGHT_MIN.x, LIGHT_MAX.x, lr.x),
+				LIGHT_MIN.y,
+				mix(LIGHT_MIN.z, LIGHT_MAX.z, lr.y)
+			);
+			vec3 toLight = lightPos - hitPos;
+			float distSq = dot(toLight, toLight);
+			float dist = sqrt(distSq);
+			vec3 wi = toLight / dist;
+
+			float cosSurf  = dot(n, wi);
+			float cosLight = dot(-wi, LIGHT_NORMAL);
+
+			if (cosSurf > 0.0 && cosLight > 0.0) {
+				vec3 shadowOrigin = hitPos + n * 0.001;
+				if (visibility(shadowOrigin, wi, dist - 0.002)) {
+					// Lambert BRDF = albedo / PI.
+					// Convert area pdf to solid-angle pdf:
+					//   pdf_omega = distSq / (cosLight * area)
+					// contribution = throughput * (albedo/PI) * cosSurf * Le / pdf_omega
+					vec3 brdf = hitAlbedo * (1.0 / PI);
+					float geom = cosSurf * cosLight / distSq;
+					radiance += throughput * brdf * LIGHT_EMISSION * geom * LIGHT_AREA;
+				}
+			}
+		}
+
+		// Diffuse Lambert bounce. Throughput update for cosine-weighted
+		// sample is just albedo (BRDF * cos / pdf simplifies to albedo).
+		throughput *= hitAlbedo;
+
+		// Russian roulette after first few bounces (bias-free).
+		if (bounce >= RR_START_BOUNCE) {
+			float p = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 1.0);
+			if (rnd() > p) break;
+			throughput /= p;
+		}
 
 		vec3 localDir = cosineHemisphere(vec2(rnd(), rnd()));
 		direction = normalize(onbFromNormal(n) * localDir);
@@ -111,7 +188,5 @@ void main()
 	vec3 mixed = (prev * n + radiance) / (n + 1.0);
 	imageStore(accumImage, ivec2(gl_LaunchIDEXT.xy), vec4(mixed, 1.0));
 
-	// Cheap clamp + linear-to-display write. Tone-mapping can be added later.
-	vec3 outColor = clamp(mixed, vec3(0.0), vec3(1.0));
-	imageStore(displayImage, ivec2(gl_LaunchIDEXT.xy), vec4(outColor, 1.0));
+	imageStore(displayImage, ivec2(gl_LaunchIDEXT.xy), vec4(toneMap(mixed), 1.0));
 }

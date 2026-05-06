@@ -54,9 +54,11 @@ void main()
 
 	vec3 bc = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
 	vec3 normal = normalize(v0.normal * bc.x + v1.normal * bc.y + v2.normal * bc.z);
+	vec3 albedo = v0.albedo * bc.x + v1.albedo * bc.y + v2.albedo * bc.z;
+	float emission = v0.emission * bc.x + v1.emission * bc.y + v2.emission * bc.z;
 
-	payload.albedo = v0.albedo;
-	payload.emission = v0.emission;
+	payload.albedo = albedo;
+	payload.emission = emission;
 	payload.normal = normal;
 	payload.t = gl_RayTmaxEXT;
 }

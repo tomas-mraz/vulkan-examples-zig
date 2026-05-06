@@ -115,6 +115,8 @@ pub const Ray6Renderer = struct {
 
     frame_index: u32 = 0,
     accum_count: u32 = 0,
+    prev_view: Mat4 = undefined,
+    prev_view_valid: bool = false,
 
     once_built: bool = false,
     sized_built: bool = false,
@@ -161,6 +163,7 @@ pub const Ray6Renderer = struct {
 
         self.frame_index = 0;
         self.accum_count = 0;
+        self.prev_view_valid = false;
 
         self.sized_built = true;
     }
@@ -203,6 +206,12 @@ pub const Ray6Renderer = struct {
         const proj = perspectiveZO(math.degreesToRadians(40.0), aspect, 0.1, 100.0);
         // Static camera at +Z = 3 looking toward -Z (front of Cornell box is open).
         const view = math.translation(0.0, 0.0, -3.0);
+
+        if (!self.prev_view_valid or !matEqual(&self.prev_view, &view)) {
+            self.accum_count = 0;
+            self.prev_view = view;
+            self.prev_view_valid = true;
+        }
 
         const ubo = UniformData{
             .view_inverse = math.invert(view),
@@ -812,6 +821,13 @@ pub const Ray6Renderer = struct {
 
 fn createShaderModule(device: Device, spv: []align(@alignOf(u32)) const u8) !vk.ShaderModule {
     return try device.createShaderModule(&.{ .code_size = spv.len, .p_code = @ptrCast(@alignCast(spv.ptr)) }, null);
+}
+
+fn matEqual(a: *const Mat4, b: *const Mat4) bool {
+    for (0..4) |c| {
+        for (0..4) |r| if (a[c][r] != b[c][r]) return false;
+    }
+    return true;
 }
 
 fn alignUp(value: u32, alignment: u32) u32 {

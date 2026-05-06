@@ -122,9 +122,12 @@ to give radiance, terminates the path).
    - [x] PCG RNG + frame seed
    - [x] Slow camera orbit so reset behavior is observable
 2. **Visual polish & noise reduction**
-   - [ ] NEE: sample the area light explicitly at every bounce
-   - [ ] Russian roulette
-   - [ ] Reinhard tone-mapping pass on display copy
+   - [x] NEE: sample the area light explicitly at every bounce
+   - [x] Russian roulette (kicks in after bounce 3)
+   - [x] Reinhard tone-mapping + gamma encode on display copy
+   - [x] Pixel jitter for free anti-aliasing through accumulation
+   - [x] Per-vertex barycentric albedo + emission interpolation
+   - [x] Reset accumulation when view matrix changes
 3. **Stretch**
    - [ ] Glossy / mirror BSDF lobe
    - [ ] Free-fly camera (WASD + mouse)
