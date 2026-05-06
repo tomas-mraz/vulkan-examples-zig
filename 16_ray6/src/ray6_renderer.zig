@@ -328,6 +328,10 @@ pub const Ray6Renderer = struct {
         try appendQuad(&verts, &indices, self.allocator, .{ 1, -1, -1 }, .{ 1, 1, -1 }, .{ 1, 1, 1 }, .{ 1, -1, 1 }, .{ -1, 0, 0 }, green, 0);
         // Light: small emissive quad just below the ceiling.
         try appendQuad(&verts, &indices, self.allocator, .{ -0.3, 0.999, 0.3 }, .{ 0.3, 0.999, 0.3 }, .{ 0.3, 0.999, -0.3 }, .{ -0.3, 0.999, -0.3 }, .{ 0, -1, 0 }, .{ 1, 1, 1 }, 8.0);
+        // Tall box near the red wall.
+        try appendBox(&verts, &indices, self.allocator, .{ -0.65, -1.0, -0.35 }, .{ -0.15, 0.3, 0.15 }, white);
+        // Short box near the green wall.
+        try appendBox(&verts, &indices, self.allocator, .{ 0.15, -1.0, -0.05 }, .{ 0.65, -0.35, 0.45 }, white);
 
         const rt_usage = vk.BufferUsageFlags{
             .shader_device_address_bit = true,
@@ -867,6 +871,31 @@ fn accumBarrier(device: Device, cmd: vk.CommandBuffer, image: vk.Image) void {
         .dst_access = .{ .shader_read_bit = true, .shader_write_bit = true },
         .aspect = .{ .color_bit = true },
     });
+}
+
+fn appendBox(
+    verts: *std.ArrayList(f32),
+    indices: *std.ArrayList(u32),
+    allocator: Allocator,
+    min: [3]f32,
+    max: [3]f32,
+    albedo: [3]f32,
+) !void {
+    const x0 = min[0]; const x1 = max[0];
+    const y0 = min[1]; const y1 = max[1];
+    const z0 = min[2]; const z1 = max[2];
+    // Bottom (y = y0, normal -Y).
+    try appendQuad(verts, indices, allocator, .{ x0, y0, z0 }, .{ x0, y0, z1 }, .{ x1, y0, z1 }, .{ x1, y0, z0 }, .{ 0, -1, 0 }, albedo, 0);
+    // Top (y = y1, normal +Y).
+    try appendQuad(verts, indices, allocator, .{ x0, y1, z0 }, .{ x1, y1, z0 }, .{ x1, y1, z1 }, .{ x0, y1, z1 }, .{ 0, 1, 0 }, albedo, 0);
+    // -X face (normal -X).
+    try appendQuad(verts, indices, allocator, .{ x0, y0, z0 }, .{ x0, y1, z0 }, .{ x0, y1, z1 }, .{ x0, y0, z1 }, .{ -1, 0, 0 }, albedo, 0);
+    // +X face (normal +X).
+    try appendQuad(verts, indices, allocator, .{ x1, y0, z1 }, .{ x1, y1, z1 }, .{ x1, y1, z0 }, .{ x1, y0, z0 }, .{ 1, 0, 0 }, albedo, 0);
+    // -Z face (normal -Z).
+    try appendQuad(verts, indices, allocator, .{ x1, y0, z0 }, .{ x1, y1, z0 }, .{ x0, y1, z0 }, .{ x0, y0, z0 }, .{ 0, 0, -1 }, albedo, 0);
+    // +Z face (normal +Z, the side closest to the camera).
+    try appendQuad(verts, indices, allocator, .{ x0, y0, z1 }, .{ x0, y1, z1 }, .{ x1, y1, z1 }, .{ x1, y0, z1 }, .{ 0, 0, 1 }, albedo, 0);
 }
 
 fn appendQuad(

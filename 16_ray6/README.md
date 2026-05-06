@@ -40,7 +40,7 @@ reset.
 - Lambert BRDF only
 - Reset-on-resize handling for both storage images
 
-### Not in scope yet (planned follow-ups)
+### Implementation in the second phase
 
 - **Next-event estimation (NEE)** — explicit area-light sampling at every bounce.
   The big variance reducer; ~50 lines of GLSL. Add after the brute-force version
