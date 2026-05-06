@@ -430,9 +430,24 @@ pub const Ray6Renderer = struct {
         // Light: small emissive quad just below the ceiling.
         try appendQuad(&verts, &indices, self.allocator, .{ -0.3, 0.999, 0.3 }, .{ 0.3, 0.999, 0.3 }, .{ 0.3, 0.999, -0.3 }, .{ -0.3, 0.999, -0.3 }, .{ 0, -1, 0 }, .{ 1, 1, 1 }, 8.0);
         // Tall box near the red wall.
-        try appendBox(&verts, &indices, self.allocator, .{ -0.65, -1.0, -0.35 }, .{ -0.15, 0.3, 0.15 }, white);
-        // Short box near the green wall.
-        try appendBox(&verts, &indices, self.allocator, .{ 0.15, -1.0, -0.05 }, .{ 0.65, -0.35, 0.45 }, white);
+        try appendBox(&verts, &indices, self.allocator, .{ -0.65, -1.0, -0.35 }, .{ -0.15, 0.3, 0.15 }, white, true);
+        // Short box near the green wall — diffuse sides, mirror top.
+        const sb_min = [3]f32{ 0.15, -1.0, -0.05 };
+        const sb_max = [3]f32{ 0.65, -0.35, 0.45 };
+        try appendBox(&verts, &indices, self.allocator, sb_min, sb_max, white, false);
+        // Mirror top quad (emission = -1 marks a perfect-mirror BRDF in the path tracer).
+        try appendQuad(
+            &verts,
+            &indices,
+            self.allocator,
+            .{ sb_min[0], sb_max[1], sb_min[2] },
+            .{ sb_max[0], sb_max[1], sb_min[2] },
+            .{ sb_max[0], sb_max[1], sb_max[2] },
+            .{ sb_min[0], sb_max[1], sb_max[2] },
+            .{ 0, 1, 0 },
+            .{ 1, 1, 1 },
+            -1.0,
+        );
 
         const rt_usage = vk.BufferUsageFlags{
             .shader_device_address_bit = true,
@@ -981,6 +996,7 @@ fn appendBox(
     min: [3]f32,
     max: [3]f32,
     albedo: [3]f32,
+    include_top: bool,
 ) !void {
     const x0 = min[0]; const x1 = max[0];
     const y0 = min[1]; const y1 = max[1];
@@ -988,7 +1004,9 @@ fn appendBox(
     // Bottom (y = y0, normal -Y).
     try appendQuad(verts, indices, allocator, .{ x0, y0, z0 }, .{ x0, y0, z1 }, .{ x1, y0, z1 }, .{ x1, y0, z0 }, .{ 0, -1, 0 }, albedo, 0);
     // Top (y = y1, normal +Y).
-    try appendQuad(verts, indices, allocator, .{ x0, y1, z0 }, .{ x1, y1, z0 }, .{ x1, y1, z1 }, .{ x0, y1, z1 }, .{ 0, 1, 0 }, albedo, 0);
+    if (include_top) {
+        try appendQuad(verts, indices, allocator, .{ x0, y1, z0 }, .{ x1, y1, z0 }, .{ x1, y1, z1 }, .{ x0, y1, z1 }, .{ 0, 1, 0 }, albedo, 0);
+    }
     // -X face (normal -X).
     try appendQuad(verts, indices, allocator, .{ x0, y0, z0 }, .{ x0, y1, z0 }, .{ x0, y1, z1 }, .{ x0, y0, z1 }, .{ -1, 0, 0 }, albedo, 0);
     // +X face (normal +X).

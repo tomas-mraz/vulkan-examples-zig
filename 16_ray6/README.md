@@ -42,16 +42,50 @@ reset.
 
 ### Implementation in the second phase
 
-- **Next-event estimation (NEE)** — explicit area-light sampling at every bounce.
-  The big variance reducer; ~50 lines of GLSL. Add after the brute-force version
-  is visibly working.
-- **Russian roulette** termination — replaces fixed bounce depth, ~10 lines.
-- **Tone mapping** (Reinhard / ACES) on the display copy. The skeleton uses raw
-  linear → sRGB swapchain.
-- **Camera controls** — mouse-look or WASD. Skeleton uses a slow auto-orbit so
-  you can verify accumulation reset works.
-- **Specular / glossy materials** — pure diffuse for now.
-- **Denoising** (SVGF / OIDN) — out of scope for this repo.
+- **Next-event estimation (NEE)** — explicit area-light sampling at every diffuse
+  bounce, with a shadow ray and area→solid-angle pdf conversion. Massive variance
+  reducer; the scene now converges in tens of frames instead of hundreds.
+- **Russian roulette** — kicks in from bounce 3, terminates by max-channel
+  throughput (clamped to [0.05, 1.0]). `MAX_BOUNCES` raised to 8.
+- **Tone mapping** — Reinhard `c/(1+c)` per channel followed by gamma 2.2 on the
+  display copy. Without this the colored bleed onto white walls clamped to white.
+- **Pixel jitter** — primary-ray sub-pixel offset uses random `vec2(rnd(), rnd())`
+  instead of fixed +0.5; gives free anti-aliasing through accumulation.
+- **Per-vertex barycentric interpolation** of albedo and emission in the
+  closest-hit shader (the original code took only `v0`).
+- **Two diffuse boxes inside the Cornell box** — tall box near the red wall,
+  short box near the green wall. They make color bleeding obvious on their
+  side faces.
+- **Mirror BRDF** on the top of the short box. Encoded as `emission < 0`
+  sentinel; the path tracer treats it as a delta lobe (perfect reflection,
+  no NEE, throughput tinted by albedo, mixed-delta-light tracking via a
+  `deltaBounce` flag so emissive hits via mirror are counted exactly once).
+- **Free-fly camera** — WSAD + mouse-look. Cursor is captured (FPS-style).
+  See _Controls_ below.
+
+### Out of scope
+
+- **Denoising** (SVGF / OIDN) — too large to fit alongside the path tracer here.
+- **Texturing**, environment maps / HDRI miss shader.
+- **Glossy** lobes (Cook-Torrance / GGX) — only Lambert + perfect mirror so far.
+
+---
+
+## Controls
+
+| key                    | action                                              |
+|------------------------|-----------------------------------------------------|
+| `W` / `S`              | move forward / back along the ground plane          |
+| `A` / `D`              | strafe left / right                                 |
+| `Space` / `Left Ctrl`  | move up / down (world Y)                            |
+| `Left/Right Shift`     | speed boost (3×)                                    |
+| **mouse**              | look around (cursor is captured)                    |
+| `Esc`                  | quit                                                |
+
+Any view change resets `accum_count` to 0 — the accumulator is overwritten
+by the next sample, so movement gives an instantly-fresh image (with the
+expected single-sample noise) that resharpens within a few seconds when you
+stop moving.
 
 ---
 
@@ -105,29 +139,37 @@ d1 = (normal.y, normal.z, uv.x,    uv.y)
 d2 = (albedo.r, albedo.g, albedo.b, emission_strength)
 ```
 
-`emission_strength == 0` → diffuse surface; `> 0` → emissive (multiplies `albedo`
-to give radiance, terminates the path).
+Material is encoded by the sign of `emission_strength`:
+
+| value     | meaning                                                              |
+|-----------|----------------------------------------------------------------------|
+| `== 0`    | diffuse Lambert surface, BRDF = albedo / π                           |
+| `> 0`     | emissive (multiplied by `albedo` for tint, terminates the path)      |
+| `< 0`     | perfect mirror BRDF — `direction = reflect(direction, n)`, throughput multiplied by `albedo` (use `1` for an untinted mirror) |
 
 ---
 
 ## Implementation roadmap
 
-1. **Skeleton** _(this commit)_
+1. **Skeleton**
    - [x] Repo scaffolding, build files, shader build wiring
    - [x] Cornell box geometry hardcoded in `ray6_renderer.zig`
+   - [x] Two diffuse boxes inside (tall by the red wall, short by the green)
    - [x] Accumulation storage image + display image
    - [x] RT pipeline + SBT (rgen / miss / chit)
    - [x] Raygen with pixel-level accumulation arithmetic
    - [x] Closest-hit with cosine hemisphere bounce + iterative loop
    - [x] PCG RNG + frame seed
-   - [x] Slow camera orbit so reset behavior is observable
 2. **Visual polish & noise reduction**
    - [x] NEE: sample the area light explicitly at every bounce
-   - [x] Russian roulette (kicks in after bounce 3)
+   - [x] Russian roulette (kicks in after bounce 3, max bounces 8)
    - [x] Reinhard tone-mapping + gamma encode on display copy
    - [x] Pixel jitter for free anti-aliasing through accumulation
    - [x] Per-vertex barycentric albedo + emission interpolation
    - [x] Reset accumulation when view matrix changes
 3. **Stretch**
-   - [ ] Glossy / mirror BSDF lobe
-   - [ ] Free-fly camera (WASD + mouse)
+   - [x] Mirror BRDF lobe (top of the short box)
+   - [x] Free-fly camera (WSAD + mouse, cursor captured)
+   - [ ] Glossy (Cook-Torrance / GGX) lobe
+   - [ ] Refractive glass (Snell + Fresnel)
+   - [ ] Environment map / HDRI miss shader
