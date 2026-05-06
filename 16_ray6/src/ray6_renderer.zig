@@ -83,6 +83,7 @@ const StorageImage = struct {
 
 pub const Ray6Renderer = struct {
     allocator: Allocator,
+    host: *ash.DesktopHost,
 
     manager: ?*ash.Manager = null,
     cmd_ctx: ?*ash.CommandContext = null,
@@ -118,11 +119,20 @@ pub const Ray6Renderer = struct {
     prev_view: Mat4 = undefined,
     prev_view_valid: bool = false,
 
+    cam_pos: [3]f32 = .{ 0.0, 0.0, 3.0 },
+    cam_yaw: f32 = 0.0,
+    cam_pitch: f32 = 0.0,
+    cursor_captured: bool = false,
+    cursor_initialized: bool = false,
+    prev_cursor_x: f64 = 0.0,
+    prev_cursor_y: f64 = 0.0,
+    last_time: f64 = 0.0,
+
     once_built: bool = false,
     sized_built: bool = false,
 
-    pub fn init(allocator: Allocator) Ray6Renderer {
-        return .{ .allocator = allocator };
+    pub fn init(allocator: Allocator, host: *ash.DesktopHost) Ray6Renderer {
+        return .{ .allocator = allocator, .host = host };
     }
 
     pub fn createOnce(self: *Ray6Renderer, session: *ash.Session) !void {
@@ -204,8 +214,9 @@ pub const Ray6Renderer = struct {
 
         const aspect: f32 = @as(f32, @floatFromInt(frame.extent.width)) / @as(f32, @floatFromInt(frame.extent.height));
         const proj = perspectiveZO(math.degreesToRadians(40.0), aspect, 0.1, 100.0);
-        // Static camera at +Z = 3 looking toward -Z (front of Cornell box is open).
-        const view = math.translation(0.0, 0.0, -3.0);
+
+        self.updateCamera();
+        const view = self.cameraView();
 
         if (!self.prev_view_valid or !matEqual(&self.prev_view, &view)) {
             self.accum_count = 0;
@@ -300,6 +311,96 @@ pub const Ray6Renderer = struct {
 
         self.frame_index +%= 1;
         self.accum_count +%= 1;
+    }
+
+    // --- FPS-style free camera (WSAD + mouse-look) ---
+
+    fn updateCamera(self: *Ray6Renderer) void {
+        const window = self.host.window orelse return;
+
+        const now = ash.glfw.getTime();
+        if (self.last_time == 0.0) self.last_time = now;
+        var dt: f32 = @floatCast(now - self.last_time);
+        self.last_time = now;
+        if (dt > 0.1) dt = 0.1; // clamp huge stalls (e.g. window drag)
+
+        if (window.getKey(.escape) == .press) {
+            window.setShouldClose(true);
+        }
+
+        // Capture cursor lazily so the user can still interact with the window
+        // before the first draw lands.
+        if (!self.cursor_captured) {
+            window.setInputModeCursor(.disabled);
+            self.cursor_captured = true;
+            self.cursor_initialized = false;
+        }
+
+        const cursor = window.getCursorPos();
+        if (!self.cursor_initialized) {
+            self.prev_cursor_x = cursor.xpos;
+            self.prev_cursor_y = cursor.ypos;
+            self.cursor_initialized = true;
+        }
+        const dx: f32 = @floatCast(cursor.xpos - self.prev_cursor_x);
+        const dy: f32 = @floatCast(cursor.ypos - self.prev_cursor_y);
+        self.prev_cursor_x = cursor.xpos;
+        self.prev_cursor_y = cursor.ypos;
+
+        const mouse_sensitivity: f32 = 0.0025;
+        self.cam_yaw -= dx * mouse_sensitivity;
+        self.cam_pitch -= dy * mouse_sensitivity;
+        const pitch_limit: f32 = math.degreesToRadians(89.0);
+        if (self.cam_pitch > pitch_limit) self.cam_pitch = pitch_limit;
+        if (self.cam_pitch < -pitch_limit) self.cam_pitch = -pitch_limit;
+
+        // World-space movement basis from yaw only — keeps WSAD on the
+        // ground plane regardless of where the camera is looking.
+        const sy = @sin(self.cam_yaw);
+        const cy = @cos(self.cam_yaw);
+        const fwd = [3]f32{ -sy, 0.0, -cy };
+        const right = [3]f32{ cy, 0.0, -sy };
+
+        var move_speed: f32 = 1.5;
+        if (window.getKey(.left_shift) == .press or window.getKey(.right_shift) == .press) {
+            move_speed *= 3.0;
+        }
+        const step = move_speed * dt;
+
+        if (window.getKey(.w) == .press) {
+            self.cam_pos[0] += fwd[0] * step;
+            self.cam_pos[1] += fwd[1] * step;
+            self.cam_pos[2] += fwd[2] * step;
+        }
+        if (window.getKey(.s) == .press) {
+            self.cam_pos[0] -= fwd[0] * step;
+            self.cam_pos[1] -= fwd[1] * step;
+            self.cam_pos[2] -= fwd[2] * step;
+        }
+        if (window.getKey(.d) == .press) {
+            self.cam_pos[0] += right[0] * step;
+            self.cam_pos[1] += right[1] * step;
+            self.cam_pos[2] += right[2] * step;
+        }
+        if (window.getKey(.a) == .press) {
+            self.cam_pos[0] -= right[0] * step;
+            self.cam_pos[1] -= right[1] * step;
+            self.cam_pos[2] -= right[2] * step;
+        }
+        if (window.getKey(.space) == .press) self.cam_pos[1] += step;
+        if (window.getKey(.left_control) == .press) self.cam_pos[1] -= step;
+    }
+
+    fn cameraView(self: *const Ray6Renderer) Mat4 {
+        const cy = @cos(self.cam_yaw);
+        const sy = @sin(self.cam_yaw);
+        const cp = @cos(self.cam_pitch);
+        const sp = @sin(self.cam_pitch);
+        // yaw=0, pitch=0 → looking down -Z, matching the original static view.
+        const fwd = math.Vec3{ .x = -sy * cp, .y = sp, .z = -cy * cp };
+        const eye = math.Vec3{ .x = self.cam_pos[0], .y = self.cam_pos[1], .z = self.cam_pos[2] };
+        const center = math.Vec3{ .x = eye.x + fwd.x, .y = eye.y + fwd.y, .z = eye.z + fwd.z };
+        return math.lookAt(eye, center, .{ .x = 0, .y = 1, .z = 0 });
     }
 
     // --- Cornell box geometry ---

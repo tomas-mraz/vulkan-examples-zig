@@ -60,7 +60,7 @@ pub fn main() !void {
             .present_mode = .mailbox,
         },
     });
-    var renderer = Ray6Renderer.init(allocator);
+    var renderer = Ray6Renderer.init(allocator, &host_impl);
 
     try session.run(&renderer);
 }
