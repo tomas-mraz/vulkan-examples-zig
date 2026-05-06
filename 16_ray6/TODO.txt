@@ -1,0 +1,31 @@
+
+co chybí v implementaci ?                                                                                                     
+                                                                                                                                
+● Setříděno podle dopadu na výsledek (od největšího):                                                                           
+                                                                                                                                
+  Korektnost:                                                                                                                   
+  1. Reset akumulace při pohybu kamery — momentálně accum_count jen donekonečna roste. Až přidáš ovládání, vznikne ghosting
+  (nové vzorky se průměrují se starými z jiného viewu). Detekovat změnu view-matice → accum_count = 0 + clear accum_img.        
+  2. Per-vertex emisivita — closesthit čte emission jen z v0. Pro stávající Cornell box to funguje (celý quad má stejný 
+  materiál), ale je to křehké.                                                                                                  
+                                                                                                                                
+  Šum / kvalita:
+  3. NEE (next-event estimation) — největší vítězství. Z každého difúzního zásahu sample bod na světle + shadow ray. U malého   
+  stropního světla zredukuje šum řádově (z desítek snímků na pár) a hlavně vyřeší tmavé rohy, kde brute force konverguje pomalu.
+  4. Pixel jitter — gl_LaunchIDEXT + 0.5 posunout o vec2(rnd(), rnd()). Free anti-aliasing přes akumulaci.                      
+  5. SPP > 1 za snímek — vnější smyčka v raygen. Rychlejší konvergence za sekundu na úkor framerate.                            
+  6. Russian roulette — místo pevného MAX_BOUNCES = 4 ukončovat podle throughput (bias-free + delší dráhy v důležitých          
+  pixelech).                                                                                                                    
+  7. Tone-mapping — teď je tam jen clamp(0,1). Reinhard x/(1+x) nebo ACES, pak gamma. Bez toho světlé plochy "vypálí" na bílo.  
+                                                                                                                                
+  Scéna:                                                    
+  8. Kovová / lesklá BRDF — jen Lambert. Pravý Cornell box má uvnitř dva kvádry (nebo kouli + kvádr) — color bleed a nepřímý    
+  stín se pak na nich pěkně projeví.                                                                                            
+  9. Background / environment — miss vrací černou. HDRI map by udělal venkovní scény.
+  10. Textury — žádná podpora.                                                                                                  
+                                                            
+  Ergonomie:                                                                                                                    
+  11. Ovládání kamery (WASD + myš) — viz roadmap v README.  
+  12. Denoiser (SVGF / OIDN) — mimo scope, ale je to největší skok v real-time PT.                                              
+                                                                                                                                
+  Pokud bys chtěl jen jednu věc: NEE. Změní to vizuální dojem nejvíc.                    
