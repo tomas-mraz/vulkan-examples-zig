@@ -431,11 +431,12 @@ pub const Ray6Renderer = struct {
         try appendQuad(&verts, &indices, self.allocator, .{ -0.3, 0.999, 0.3 }, .{ 0.3, 0.999, 0.3 }, .{ 0.3, 0.999, -0.3 }, .{ -0.3, 0.999, -0.3 }, .{ 0, -1, 0 }, .{ 1, 1, 1 }, 8.0);
         // Tall box near the red wall.
         try appendBox(&verts, &indices, self.allocator, .{ -0.65, -1.0, -0.35 }, .{ -0.15, 0.3, 0.15 }, white, true);
-        // Short box near the green wall — diffuse sides, mirror top.
+        // Short box near the green wall — diffuse sides, glossy top.
         const sb_min = [3]f32{ 0.15, -1.0, -0.05 };
         const sb_max = [3]f32{ 0.65, -0.35, 0.45 };
         try appendBox(&verts, &indices, self.allocator, sb_min, sb_max, white, false);
-        // Mirror top quad (emission = -1 marks a perfect-mirror BRDF in the path tracer).
+        // Glossy top quad: emission = -(1 + roughness). roughness 0 ⇒ -1.0 = perfect mirror,
+        // 0.15 here ⇒ tight specular lobe with visible blur. F0 = albedo (metallic-tinted).
         try appendQuad(
             &verts,
             &indices,
@@ -446,7 +447,7 @@ pub const Ray6Renderer = struct {
             .{ sb_min[0], sb_max[1], sb_max[2] },
             .{ 0, 1, 0 },
             .{ 1, 1, 1 },
-            -1.0,
+            -1.15,
         );
 
         const rt_usage = vk.BufferUsageFlags{

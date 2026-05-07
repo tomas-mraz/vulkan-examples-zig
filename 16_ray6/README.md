@@ -56,18 +56,21 @@ reset.
 - **Two diffuse boxes inside the Cornell box** — tall box near the red wall,
   short box near the green wall. They make color bleeding obvious on their
   side faces.
-- **Mirror BRDF** on the top of the short box. Encoded as `emission < 0`
-  sentinel; the path tracer treats it as a delta lobe (perfect reflection,
-  no NEE, throughput tinted by albedo, mixed-delta-light tracking via a
-  `deltaBounce` flag so emissive hits via mirror are counted exactly once).
+- **Glossy / mirror BRDF** on the top of the short box. Encoded as
+  `emission < -0.5` sentinel with `roughness = -emission - 1.0`. The path
+  tracer dispatches to either a delta lobe (`roughness < 1e-3`: perfect
+  reflection, no NEE, throughput tinted by albedo) or a GGX microfacet path
+  (Trowbridge-Reitz `D`, height-correlated Smith `G2`, Schlick `F` with
+  `F0 = albedo`). The GGX path uses VNDF importance sampling (Heitz 2018)
+  and combines NEE with the BSDF sample via the **power-heuristic MIS** —
+  necessary for low-roughness lobes where pure NEE has near-zero BRDF and
+  pure BSDF sampling rarely hits the small ceiling light. Direct-emission
+  accounting on the next emissive hit is tracked through a `pdfBsdfPrev`
+  sentinel float (`< 0` count, `0` skip, `> 0` MIS-weight).
 - **Free-fly camera** — WSAD + mouse-look. Cursor is captured (FPS-style).
   See _Controls_ below.
-
-### Out of scope
-
 - **Denoising** (SVGF / OIDN) — too large to fit alongside the path tracer here.
 - **Texturing**, environment maps / HDRI miss shader.
-- **Glossy** lobes (Cook-Torrance / GGX) — only Lambert + perfect mirror so far.
 
 ---
 
@@ -141,11 +144,11 @@ d2 = (albedo.r, albedo.g, albedo.b, emission_strength)
 
 Material is encoded by the sign of `emission_strength`:
 
-| value     | meaning                                                              |
-|-----------|----------------------------------------------------------------------|
-| `== 0`    | diffuse Lambert surface, BRDF = albedo / π                           |
-| `> 0`     | emissive (multiplied by `albedo` for tint, terminates the path)      |
-| `< 0`     | perfect mirror BRDF — `direction = reflect(direction, n)`, throughput multiplied by `albedo` (use `1` for an untinted mirror) |
+| value      | meaning                                                              |
+|------------|----------------------------------------------------------------------|
+| `== 0`     | diffuse Lambert surface, BRDF = albedo / π                           |
+| `> 0`      | emissive (multiplied by `albedo` for tint, terminates the path)      |
+| `< -0.5`   | glossy GGX with `roughness = -emission - 1.0`. `roughness == 0` (i.e. `emission == -1.0`) collapses to a perfect mirror (delta lobe, no NEE). `F0 = albedo` (metallic-tinted) |
 
 ---
 
@@ -170,6 +173,6 @@ Material is encoded by the sign of `emission_strength`:
 3. **Stretch**
    - [x] Mirror BRDF lobe (top of the short box)
    - [x] Free-fly camera (WSAD + mouse, cursor captured)
-   - [ ] Glossy (Cook-Torrance / GGX) lobe
+   - [x] Glossy GGX lobe with VNDF sampling and NEE+BSDF MIS
    - [ ] Refractive glass (Snell + Fresnel)
    - [ ] Environment map / HDRI miss shader
