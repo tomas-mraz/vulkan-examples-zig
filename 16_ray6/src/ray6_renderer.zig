@@ -414,23 +414,38 @@ pub const Ray6Renderer = struct {
         const white = [3]f32{ 0.73, 0.73, 0.73 };
         const red = [3]f32{ 0.65, 0.05, 0.05 };
         const green = [3]f32{ 0.12, 0.45, 0.15 };
+        const blue = [3]f32{ 0.10, 0.20, 0.65 };
 
         // Box from (-1,-1,-1) to (1,1,1), front (+Z) wall omitted so the
         // camera at z=+3 looks into the open box.
-        // Floor (y = -1, normal up).
-        try appendQuad(&verts, &indices, self.allocator, .{ -1, -1, -1 }, .{ 1, -1, -1 }, .{ 1, -1, 1 }, .{ -1, -1, 1 }, .{ 0, 1, 0 }, white, 0);
+        // Floor (y = -1, normal up) — metallic glossy, F0 = white, roughness 0.3.
+        try appendQuad(&verts, &indices, self.allocator, .{ -1, -1, -1 }, .{ 1, -1, -1 }, .{ 1, -1, 1 }, .{ -1, -1, 1 }, .{ 0, 1, 0 }, white, -1.3);
         // Ceiling (y = 1, normal down).
         try appendQuad(&verts, &indices, self.allocator, .{ -1, 1, 1 }, .{ 1, 1, 1 }, .{ 1, 1, -1 }, .{ -1, 1, -1 }, .{ 0, -1, 0 }, white, 0);
         // Back wall (z = -1, normal +Z).
         try appendQuad(&verts, &indices, self.allocator, .{ -1, -1, -1 }, .{ -1, 1, -1 }, .{ 1, 1, -1 }, .{ 1, -1, -1 }, .{ 0, 0, 1 }, white, 0);
         // Left wall (x = -1, red, normal +X).
         try appendQuad(&verts, &indices, self.allocator, .{ -1, -1, 1 }, .{ -1, 1, 1 }, .{ -1, 1, -1 }, .{ -1, -1, -1 }, .{ 1, 0, 0 }, red, 0);
-        // Right wall (x = 1, green, normal -X).
-        try appendQuad(&verts, &indices, self.allocator, .{ 1, -1, -1 }, .{ 1, 1, -1 }, .{ 1, 1, 1 }, .{ 1, -1, 1 }, .{ -1, 0, 0 }, green, 0);
+        // Right wall (x = 1, green, normal -X) — glossy roughness 0.7.
+        try appendQuad(&verts, &indices, self.allocator, .{ 1, -1, -1 }, .{ 1, 1, -1 }, .{ 1, 1, 1 }, .{ 1, -1, 1 }, .{ -1, 0, 0 }, green, -1.7);
         // Light: small emissive quad just below the ceiling.
         try appendQuad(&verts, &indices, self.allocator, .{ -0.3, 0.999, 0.3 }, .{ 0.3, 0.999, 0.3 }, .{ 0.3, 0.999, -0.3 }, .{ -0.3, 0.999, -0.3 }, .{ 0, -1, 0 }, .{ 1, 1, 1 }, 8.0);
         // Tall box near the red wall.
         try appendBox(&verts, &indices, self.allocator, .{ -0.65, -1.0, -0.35 }, .{ -0.15, 0.3, 0.15 }, white, true);
+        // Blue overlay on the +X face (the side facing the green wall). Offset by 0.001
+        // outward to win the coplanar tie-break against the white face underneath.
+        try appendQuad(
+            &verts,
+            &indices,
+            self.allocator,
+            .{ -0.149, -1.0,  0.15 },
+            .{ -0.149,  0.3,  0.15 },
+            .{ -0.149,  0.3, -0.35 },
+            .{ -0.149, -1.0, -0.35 },
+            .{ 1, 0, 0 },
+            blue,
+            0,
+        );
         // Short box near the green wall — diffuse sides, glossy top.
         const sb_min = [3]f32{ 0.15, -1.0, -0.05 };
         const sb_max = [3]f32{ 0.65, -0.35, 0.45 };

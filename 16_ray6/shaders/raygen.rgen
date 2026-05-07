@@ -121,16 +121,6 @@ vec3 sampleVNDF(vec3 Ve, float alpha, vec2 r)
 	return normalize(vec3(alpha * Nh.x, alpha * Nh.y, max(0.0, Nh.z)));
 }
 
-// pdf in solid angle of a wi reflected off a VNDF-sampled wm, given wo (tangent space).
-float pdfGGX_VNDF(vec3 wo, vec3 wm, float alpha2)
-{
-	float NoV = max(wo.z, 0.0);
-	if (NoV <= 0.0) return 0.0;
-	float NoH = max(wm.z, 0.0);
-	float D = D_GGX(NoH, alpha2);
-	float G1 = G1_GGX(NoV, alpha2);
-	return G1 * D / (4.0 * NoV);
-}
 
 // Power heuristic, beta = 2.
 float powerHeuristic(float a, float b)
@@ -221,7 +211,7 @@ void main()
 			break;
 		}
 
-		// Glossy / mirror BRDF (sentinel: emission < -0.5).
+		// Metallic glossy / mirror BRDF (sentinel: emission < -0.5).
 		// Decoded as roughness = -emission - 1.0  (mirror = 0, max = 1).
 		if (hitEmission < -0.5) {
 			float roughness = clamp(-hitEmission - 1.0, 0.0, 1.0);
