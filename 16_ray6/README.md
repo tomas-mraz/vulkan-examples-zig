@@ -148,7 +148,7 @@ Material is encoded by the sign of `emission_strength`:
 |------------|----------------------------------------------------------------------|
 | `== 0`     | diffuse Lambert surface, BRDF = albedo / π                           |
 | `> 0`      | emissive (multiplied by `albedo` for tint, terminates the path)      |
-| `< -0.5`   | glossy GGX with `roughness = -emission - 1.0`. `roughness == 0` (i.e. `emission == -1.0`) collapses to a perfect mirror (delta lobe, no NEE). `F0 = albedo` (metallic-tinted) |
+| `< -0.5`   | glossy GGX with `roughness = -emission - 1.0` (clamped to `[1e-4, 1]`). `F0 = albedo` (metallic-tinted) |
 
 ---
 

@@ -27,7 +27,6 @@ layout(location = 0) rayPayloadEXT RayPayload payload;
 const float PI = 3.14159265358979323846;
 const int MAX_BOUNCES = 8;
 const int RR_START_BOUNCE = 3;
-const float GLOSSY_DELTA_CUTOFF = 0.001; // roughness below this → treat as perfect mirror
 
 // Hardcoded Cornell-box ceiling light. Must match geometry built in
 // ray6_renderer.zig (small emissive quad at y = 0.999).
@@ -211,27 +210,12 @@ void main()
 			break;
 		}
 
-		// Metallic glossy / mirror BRDF (sentinel: emission < -0.5).
-		// Decoded as roughness = -emission - 1.0  (mirror = 0, max = 1).
+		// Metallic glossy GGX (sentinel: emission < -0.5).
+		// Decoded as roughness = -emission - 1.0, clamped to [eps, 1].
 		if (hitEmission < -0.5) {
 			float roughness = clamp(-hitEmission - 1.0, 0.0, 1.0);
-
-			if (roughness < GLOSSY_DELTA_CUTOFF) {
-				// Delta mirror: perfect specular, no NEE, throughput tinted by albedo.
-				throughput *= hitAlbedo;
-				direction = reflect(direction, n);
-				origin = hitPos + n * 0.001;
-				pdfBsdfPrev = -1.0; // count direct hit on next emissive surface
-				if (bounce >= RR_START_BOUNCE) {
-					float p = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 1.0);
-					if (rnd() > p) break;
-					throughput /= p;
-				}
-				continue;
-			}
-
 			// --- GGX glossy with NEE + BSDF MIS ---
-			float alpha = roughness * roughness;
+			float alpha = max(roughness * roughness, 1e-4); // floor avoids NaN at r→0
 			float alpha2 = alpha * alpha;
 			vec3 F0 = hitAlbedo;
 
