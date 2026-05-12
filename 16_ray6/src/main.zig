@@ -57,7 +57,7 @@ pub fn main() !void {
             .api_version = vk.API_VERSION_1_2.toU32(),
         },
         .swapchain_options = .{
-            .present_mode = .mailbox,
+            .present_mode = .fifo,
         },
     });
     var renderer = Ray6Renderer.init(allocator, &host_impl);

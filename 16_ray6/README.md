@@ -149,6 +149,7 @@ Material is encoded by the sign of `emission_strength`:
 | `== 0`     | diffuse Lambert surface, BRDF = albedo / π                           |
 | `> 0`      | emissive (multiplied by `albedo` for tint, terminates the path)      |
 | `< -0.5`   | glossy GGX with `roughness = -emission - 1.0` (clamped to `[1e-4, 1]`). `F0 = albedo` (metallic-tinted) |
+| `< -10`    | dielectric glass with `IOR = -emission * 0.1`. Schlick Fresnel splits perfect reflect/refract; TIR handled |
 
 ---
 
@@ -174,5 +175,5 @@ Material is encoded by the sign of `emission_strength`:
    - [x] Mirror BRDF lobe (top of the short box)
    - [x] Free-fly camera (WSAD + mouse, cursor captured)
    - [x] Glossy GGX lobe with VNDF sampling and NEE+BSDF MIS
-   - [ ] Refractive glass (Snell + Fresnel)
+   - [x] Refractive glass (Snell + Fresnel)
    - [ ] Environment map / HDRI miss shader

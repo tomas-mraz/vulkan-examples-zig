@@ -465,6 +465,23 @@ pub const Ray6Renderer = struct {
             .{ 1, 1, 1 },
             -1.15,
         );
+        // Glass sphere — sentinel emission = -10 * IOR. IOR = 1.5 ⇒ emission = -15.
+        // Sits on the floor in the front-center area, between the two boxes.
+        try appendSphere(&verts, &indices, self.allocator, .{ -0.175, -0.65, 0.65 }, 0.35, 24, 48, .{ 1, 1, 1 }, -15.0);
+        // Orange glass slab hanging above the short box. Width matches short box X-extent,
+        // height matches the box wall (0.65), thin in Z. Albedo tints transmitted light:
+        // R=100%, G=50%, B=10% per traversal ⇒ orange with ~50% translucency.
+        const orange_glass = [3]f32{ 1.0, 0.5, 0.1 };
+        try appendBox(
+            &verts,
+            &indices,
+            self.allocator,
+            .{ sb_min[0], 0.0,  0.175 },
+            .{ sb_max[0], 0.65, 0.225 },
+            orange_glass,
+            true,
+            -15.0,
+        );
 
         const rt_usage = vk.BufferUsageFlags{
             .shader_device_address_bit = true,
@@ -1061,6 +1078,55 @@ fn appendQuad(
         base,     base + 1, base + 2,
         base,     base + 2, base + 3,
     });
+}
+
+fn appendSphere(
+    verts: *std.ArrayList(f32),
+    indices: *std.ArrayList(u32),
+    allocator: Allocator,
+    center: [3]f32,
+    radius: f32,
+    stacks: u32,
+    sectors: u32,
+    albedo: [3]f32,
+    emission: f32,
+) !void {
+    const base: u32 = @intCast(verts.items.len / floats_per_vertex);
+    const pi: f32 = std.math.pi;
+
+    var i: u32 = 0;
+    while (i <= stacks) : (i += 1) {
+        const phi = pi * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(stacks));
+        const cy = @cos(phi);
+        const sy = @sin(phi);
+        var j: u32 = 0;
+        while (j <= sectors) : (j += 1) {
+            const theta = 2.0 * pi * @as(f32, @floatFromInt(j)) / @as(f32, @floatFromInt(sectors));
+            const nx = sy * @cos(theta);
+            const nz = sy * @sin(theta);
+            const ny = cy;
+            const px = center[0] + radius * nx;
+            const py = center[1] + radius * ny;
+            const pz = center[2] + radius * nz;
+            try verts.appendSlice(allocator, &.{
+                px,        py,        pz,
+                nx,        ny,        nz,
+                0.0,       0.0,
+                albedo[0], albedo[1], albedo[2], emission,
+            });
+        }
+    }
+
+    const row: u32 = sectors + 1;
+    var s: u32 = 0;
+    while (s < stacks) : (s += 1) {
+        var t: u32 = 0;
+        while (t < sectors) : (t += 1) {
+            const k1 = base + s * row + t;
+            const k2 = k1 + row;
+            try indices.appendSlice(allocator, &.{ k1, k2, k1 + 1, k1 + 1, k2, k2 + 1 });
+        }
+    }
 }
 
 fn perspectiveZO(y_fov: f32, aspect: f32, near: f32, far: f32) Mat4 {
