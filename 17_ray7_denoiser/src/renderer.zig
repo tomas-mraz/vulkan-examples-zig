@@ -101,6 +101,9 @@ pub const Renderer = struct {
 
     accum_img: StorageImage = .{},
     display_img: StorageImage = .{},
+    gbuf_normal_depth: StorageImage = .{},
+    gbuf_motion: StorageImage = .{},
+    albedo_img: StorageImage = .{},
 
     uniforms: []Buffer = &.{},
     desc_pool: vk.DescriptorPool = .null_handle,
@@ -164,6 +167,9 @@ pub const Renderer = struct {
 
         try self.createAccumulationImage(extent);
         try self.createDisplayImage(extent, display_format);
+        try self.createGenericStorageImage(&self.gbuf_normal_depth, extent, .r16g16b16a16_sfloat);
+        try self.createGenericStorageImage(&self.gbuf_motion, extent, .r16g16_sfloat);
+        try self.createGenericStorageImage(&self.albedo_img, extent, .r8g8b8a8_unorm);
         try self.initImageLayouts();
 
         try self.createUniformBuffers(swap_len);
@@ -203,6 +209,9 @@ pub const Renderer = struct {
         for (self.uniforms) |*ub| ub.deinit(device);
         if (self.uniforms.len != 0) self.allocator.free(self.uniforms);
         self.uniforms = &.{};
+        self.albedo_img.deinit(device);
+        self.gbuf_motion.deinit(device);
+        self.gbuf_normal_depth.deinit(device);
         self.display_img.deinit(device);
         self.accum_img.deinit(device);
         self.sized_built = false;
@@ -799,6 +808,23 @@ pub const Renderer = struct {
             .aspect = .{ .color_bit = true },
         });
 
+        // G-buffer images: raygen overwrites them every frame, so a plain
+        // undefined → general transition is enough; no need to clear.
+        const gbuf_targets = [_]vk.Image{
+            self.gbuf_normal_depth.image,
+            self.gbuf_motion.image,
+            self.albedo_img.image,
+        };
+        for (gbuf_targets) |img| {
+            transitionImage(device, cmd, img, .undefined, .general, .{
+                .src_stage = .{ .top_of_pipe_bit = true },
+                .dst_stage = .{ .ray_tracing_shader_bit_khr = true },
+                .src_access = .{},
+                .dst_access = .{ .shader_write_bit = true },
+                .aspect = .{ .color_bit = true },
+            });
+        }
+
         try self.cmd_ctx.?.endOneTime(self.manager.?.graphics_queue.handle, cmd);
     }
 
@@ -830,6 +856,9 @@ pub const Renderer = struct {
             .{ .binding = 3, .descriptor_type = .uniform_buffer, .descriptor_count = 1, .stage_flags = stage_rgen_rchit_rmiss },
             .{ .binding = 4, .descriptor_type = .storage_buffer, .descriptor_count = 1, .stage_flags = stage_rchit },
             .{ .binding = 5, .descriptor_type = .storage_buffer, .descriptor_count = 1, .stage_flags = stage_rchit },
+            .{ .binding = 6, .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_rgen },
+            .{ .binding = 7, .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_rgen },
+            .{ .binding = 8, .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_rgen },
         };
         self.desc_set_layout = try device.createDescriptorSetLayout(&.{
             .binding_count = bindings.len,
@@ -839,7 +868,7 @@ pub const Renderer = struct {
         const count_u32: u32 = @intCast(count);
         const pool_sizes = [_]vk.DescriptorPoolSize{
             .{ .type = .acceleration_structure_khr, .descriptor_count = count_u32 },
-            .{ .type = .storage_image, .descriptor_count = count_u32 * 2 },
+            .{ .type = .storage_image, .descriptor_count = count_u32 * 5 },
             .{ .type = .uniform_buffer, .descriptor_count = count_u32 },
             .{ .type = .storage_buffer, .descriptor_count = count_u32 * 2 },
         };
@@ -861,6 +890,9 @@ pub const Renderer = struct {
 
         const accum_info = vk.DescriptorImageInfo{ .sampler = .null_handle, .image_view = self.accum_img.view, .image_layout = .general };
         const display_info = vk.DescriptorImageInfo{ .sampler = .null_handle, .image_view = self.display_img.view, .image_layout = .general };
+        const gbuf_normal_depth_info = vk.DescriptorImageInfo{ .sampler = .null_handle, .image_view = self.gbuf_normal_depth.view, .image_layout = .general };
+        const gbuf_motion_info = vk.DescriptorImageInfo{ .sampler = .null_handle, .image_view = self.gbuf_motion.view, .image_layout = .general };
+        const albedo_info = vk.DescriptorImageInfo{ .sampler = .null_handle, .image_view = self.albedo_img.view, .image_layout = .general };
         const vertex_info = vk.DescriptorBufferInfo{ .buffer = self.vertex_buf.buffer, .offset = 0, .range = vk.WHOLE_SIZE };
         const index_info = vk.DescriptorBufferInfo{ .buffer = self.index_buf.buffer, .offset = 0, .range = vk.WHOLE_SIZE };
 
@@ -878,6 +910,9 @@ pub const Renderer = struct {
                 .{ .dst_set = self.desc_sets[i], .dst_binding = 3, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .uniform_buffer, .p_image_info = undefined, .p_buffer_info = @ptrCast(&ubo_info), .p_texel_buffer_view = undefined },
                 .{ .dst_set = self.desc_sets[i], .dst_binding = 4, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_image_info = undefined, .p_buffer_info = @ptrCast(&vertex_info), .p_texel_buffer_view = undefined },
                 .{ .dst_set = self.desc_sets[i], .dst_binding = 5, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_image_info = undefined, .p_buffer_info = @ptrCast(&index_info), .p_texel_buffer_view = undefined },
+                .{ .dst_set = self.desc_sets[i], .dst_binding = 6, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_image, .p_image_info = @ptrCast(&gbuf_normal_depth_info), .p_buffer_info = undefined, .p_texel_buffer_view = undefined },
+                .{ .dst_set = self.desc_sets[i], .dst_binding = 7, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_image, .p_image_info = @ptrCast(&gbuf_motion_info), .p_buffer_info = undefined, .p_texel_buffer_view = undefined },
+                .{ .dst_set = self.desc_sets[i], .dst_binding = 8, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_image, .p_image_info = @ptrCast(&albedo_info), .p_buffer_info = undefined, .p_texel_buffer_view = undefined },
             };
             device.updateDescriptorSets(&writes, null);
         }

@@ -14,6 +14,9 @@ layout(binding = 3, set = 0) uniform CameraProperties
 	uint _pad0;
 	uint _pad1;
 } ubo;
+layout(binding = 6, set = 0, rgba16f) uniform image2D gbufNormalDepth;
+layout(binding = 7, set = 0, rg16f)   uniform image2D gbufMotion;
+layout(binding = 8, set = 0, rgba8)   uniform image2D albedoImage;
 
 struct RayPayload {
 	vec3 albedo;
@@ -176,6 +179,23 @@ void main()
 
 	for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
 		traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xff, 0, 0, 0, origin, 0.001, direction, 10000.0, 0);
+
+		// G-buffer from the primary hit. Written unconditionally so the
+		// denoiser always has a valid sample, even on primary miss.
+		if (bounce == 0) {
+			ivec2 px = ivec2(gl_LaunchIDEXT.xy);
+			if (payload.t < 0.0) {
+				imageStore(gbufNormalDepth, px, vec4(0.0, 0.0, 0.0, 1e6));
+				imageStore(albedoImage, px, vec4(0.0, 0.0, 0.0, 1.0));
+			} else {
+				vec3 nGB = payload.normal;
+				if (dot(nGB, direction) > 0.0) nGB = -nGB;
+				imageStore(gbufNormalDepth, px, vec4(nGB, payload.t));
+				imageStore(albedoImage, px, vec4(payload.albedo, 1.0));
+			}
+			// TODO: real motion vector once previous-frame viewProj lands in the UBO.
+			imageStore(gbufMotion, px, vec4(0.0, 0.0, 0.0, 0.0));
+		}
 
 		if (payload.t < 0.0) {
 			// Miss: closed Cornell box, treat as black.

@@ -133,7 +133,7 @@ pipeline phases.
 |---------|----------------------------|---------------------------|--------------------------------------------------|
 | 0       | acceleration_structure_khr | rgen, rchit               | TLAS                                             |
 | 1       | storage_image (rgba16f)    | rgen, comp                | `radiance_demodulated` — 1-SPP path-trace output |
-| 2       | storage_image (rgba16f)    | rgen, comp                | `gbuffer_normal_depth` — view-space N + linear z |
+| 2       | storage_image (rgba16f)    | rgen, comp                | `gbuffer_normal_depth` — world-space N + hitT    |
 | 3       | storage_image (rg16f)      | rgen, comp                | `gbuffer_motion` — screen-space motion vector    |
 | 4       | storage_image (rgba8)      | rgen, comp                | `albedo` — first-hit albedo (for re-modulation)  |
 | 5       | storage_image (rgba16f)    | comp                      | `history_curr` — temporal accum output           |
@@ -232,9 +232,11 @@ primary hit** and write the G-buffer.
   operates on the low-frequency illumination signal, so it doesn't blur away
   texture/material detail (re-applied in `remodulate.comp`).
 - G-buffer write on first hit only: `gbuffer_normal_depth` (`rgba16f`,
-  `.xyz` = view-space normal, `.w` = view-space linear depth),
+  `.xyz` = world-space normal, `.w` = ray hit distance `hitT`),
   `gbuffer_motion` (`rg16f`, computed from previous-frame `viewProj` × current
   world-space hit point), `albedo` (`rgba8`, first-hit material colour).
+  World-space normal + hit distance keeps the G-buffer camera-independent —
+  cross-frame disocclusion tests then work directly off invariant quantities.
 - Glass / mirror primary hits: write the first non-specular hit's data into
   the G-buffer (otherwise the denoiser tries to filter through perfect
   reflections, which is wrong). Marker bit in `albedo.a` can disable
@@ -400,7 +402,7 @@ paper, code is original GLSL.
    - [x] Refractive glass (Snell + Fresnel)
    - [ ] Environment map / HDRI miss shader
 4. **Denoiser — new in 17**
-   - [ ] G-buffer storage images (normal+depth, motion, albedo) + raygen writes
+   - [x] G-buffer storage images (normal+depth, motion, albedo) + raygen writes
    - [ ] Albedo demodulation in raygen + remodulation in final compute pass
    - [ ] Previous-frame `viewProj` in UBO + motion-vector math
    - [ ] Debug F-key cycle through G-buffer outputs (`F1`=normal, `F2`=depth,
