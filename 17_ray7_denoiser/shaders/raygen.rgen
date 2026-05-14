@@ -1,0 +1,400 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_shader_image_load_formatted : enable
+
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+layout(binding = 1, set = 0, rgba32f) uniform image2D accumImage;
+layout(binding = 2, set = 0) uniform image2D displayImage;
+layout(binding = 3, set = 0) uniform CameraProperties
+{
+	mat4 viewInverse;
+	mat4 projInverse;
+	uint frameIndex;
+	uint accumCount;
+	uint _pad0;
+	uint _pad1;
+} ubo;
+
+struct RayPayload {
+	vec3 albedo;
+	float t;
+	vec3 normal;
+	float emission;
+};
+
+layout(location = 0) rayPayloadEXT RayPayload payload;
+
+const float PI = 3.14159265358979323846;
+const int MAX_BOUNCES = 8;
+const int RR_START_BOUNCE = 3;
+
+// Hardcoded Cornell-box ceiling light. Must match geometry built in
+// ray6_renderer.zig (small emissive quad at y = 0.999).
+const vec3 LIGHT_MIN = vec3(-0.3, 0.999, -0.3);
+const vec3 LIGHT_MAX = vec3( 0.3, 0.999,  0.3);
+const vec3 LIGHT_NORMAL = vec3(0.0, -1.0, 0.0);
+const vec3 LIGHT_EMISSION = vec3(8.0, 8.0, 8.0);
+const float LIGHT_AREA = (LIGHT_MAX.x - LIGHT_MIN.x) * (LIGHT_MAX.z - LIGHT_MIN.z);
+
+// PCG hash, returns uint in [0, 0xFFFFFFFF].
+uint pcg(uint v)
+{
+	uint state = v * 747796405u + 2891336453u;
+	uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+	return (word >> 22u) ^ word;
+}
+
+uint rngState;
+float rnd()
+{
+	rngState = pcg(rngState);
+	return float(rngState) * (1.0 / 4294967296.0);
+}
+
+// Frisvad's branchless ONB; columns are (T, B, N).
+mat3 onbFromNormal(vec3 n)
+{
+	float s = (n.z >= 0.0) ? 1.0 : -1.0;
+	float a = -1.0 / (s + n.z);
+	float b = n.x * n.y * a;
+	vec3 t = vec3(1.0 + s * n.x * n.x * a, s * b, -s * n.x);
+	vec3 bn = vec3(b, s + n.y * n.y * a, -n.y);
+	return mat3(t, bn, n);
+}
+
+// Cosine-weighted hemisphere sample around +Z (Malley's method).
+vec3 cosineHemisphere(vec2 r)
+{
+	float r1 = sqrt(r.x);
+	float phi = 2.0 * PI * r.y;
+	return vec3(r1 * cos(phi), r1 * sin(phi), sqrt(max(0.0, 1.0 - r.x)));
+}
+
+// --- GGX / Trowbridge-Reitz with isotropic alpha = roughness^2 ---
+
+float D_GGX(float NoH, float alpha2)
+{
+	float t = (NoH * NoH) * (alpha2 - 1.0) + 1.0;
+	return alpha2 / (PI * t * t);
+}
+
+// Smith Lambda for GGX, used in G1 and G2 (height-correlated).
+float smithLambdaGGX(float cosTheta, float alpha2)
+{
+	float c2 = cosTheta * cosTheta;
+	return 0.5 * (-1.0 + sqrt(1.0 + alpha2 * (1.0 - c2) / max(c2, 1e-7)));
+}
+
+float G1_GGX(float NoV, float alpha2)
+{
+	return 1.0 / (1.0 + smithLambdaGGX(NoV, alpha2));
+}
+
+// Height-correlated Smith G2.
+float G2_GGX(float NoV, float NoL, float alpha2)
+{
+	return 1.0 / (1.0 + smithLambdaGGX(NoV, alpha2) + smithLambdaGGX(NoL, alpha2));
+}
+
+vec3 F_Schlick(vec3 F0, float VoH)
+{
+	float f = pow(clamp(1.0 - VoH, 0.0, 1.0), 5.0);
+	return F0 + (vec3(1.0) - F0) * f;
+}
+
+// VNDF sampling (Heitz 2018, JCGT). Ve is the view direction in tangent space (z up).
+// Returns a microfacet normal wm in tangent space.
+vec3 sampleVNDF(vec3 Ve, float alpha, vec2 r)
+{
+	vec3 Vh = normalize(vec3(alpha * Ve.x, alpha * Ve.y, Ve.z));
+	float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
+	vec3 T1 = lensq > 0.0 ? vec3(-Vh.y, Vh.x, 0.0) * inversesqrt(lensq) : vec3(1.0, 0.0, 0.0);
+	vec3 T2 = cross(Vh, T1);
+	float rr = sqrt(r.x);
+	float phi = 2.0 * PI * r.y;
+	float t1 = rr * cos(phi);
+	float t2 = rr * sin(phi);
+	float s = 0.5 * (1.0 + Vh.z);
+	t2 = (1.0 - s) * sqrt(1.0 - t1 * t1) + s * t2;
+	vec3 Nh = t1 * T1 + t2 * T2 + sqrt(max(0.0, 1.0 - t1 * t1 - t2 * t2)) * Vh;
+	return normalize(vec3(alpha * Nh.x, alpha * Nh.y, max(0.0, Nh.z)));
+}
+
+
+// Power heuristic, beta = 2.
+float powerHeuristic(float a, float b)
+{
+	float a2 = a * a;
+	return a2 / (a2 + b * b);
+}
+
+// Shadow query: returns true if the segment from `from` along `dir` for
+// `dist` units is unoccluded. Uses the same payload as the path trace —
+// safe because we save the surface state before calling.
+bool visibility(vec3 from, vec3 dir, float dist)
+{
+	payload.t = 1.0; // sentinel; miss shader sets it to -1.0
+	uint flags = gl_RayFlagsOpaqueEXT
+	           | gl_RayFlagsTerminateOnFirstHitEXT
+	           | gl_RayFlagsSkipClosestHitShaderEXT;
+	traceRayEXT(topLevelAS, flags, 0xff, 0, 0, 0, from, 0.001, dir, dist, 0);
+	return payload.t < 0.0;
+}
+
+// Reinhard tone-map + sRGB-ish gamma encoding.
+vec3 toneMap(vec3 hdr)
+{
+	vec3 mapped = hdr / (vec3(1.0) + hdr);
+	return pow(mapped, vec3(1.0 / 2.2));
+}
+
+void main()
+{
+	rngState = pcg(gl_LaunchIDEXT.x * 1973u + gl_LaunchIDEXT.y * 9277u + ubo.frameIndex * 26699u + 1u);
+
+	// Pixel jitter for free anti-aliasing through accumulation.
+	const vec2 jitter = vec2(rnd(), rnd());
+	const vec2 pixelCenter = vec2(gl_LaunchIDEXT.xy) + jitter;
+	const vec2 inUV = pixelCenter / vec2(gl_LaunchSizeEXT.xy);
+	vec2 d = inUV * 2.0 - 1.0;
+
+	vec4 origin4 = ubo.viewInverse * vec4(0, 0, 0, 1);
+	vec4 target = ubo.projInverse * vec4(d.x, d.y, 1, 1);
+	vec4 dir4 = ubo.viewInverse * vec4(normalize(target.xyz / target.w), 0);
+
+	vec3 origin = origin4.xyz;
+	vec3 direction = dir4.xyz;
+
+	vec3 throughput = vec3(1.0);
+	vec3 radiance = vec3(0.0);
+	// Tracks how to count direct emission on the next emissive hit:
+	//   < 0  : primary ray or delta (mirror) bounce — count fully.
+	//   == 0 : last bounce was diffuse, NEE handled direct light — skip emission.
+	//   > 0  : last bounce was glossy BSDF sample with this solid-angle pdf —
+	//          MIS weight against pdf_NEE for the hit point on the light.
+	float pdfBsdfPrev = -1.0;
+
+	for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
+		traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xff, 0, 0, 0, origin, 0.001, direction, 10000.0, 0);
+
+		if (payload.t < 0.0) {
+			// Miss: closed Cornell box, treat as black.
+			break;
+		}
+
+		// Save the surface state — NEE/visibility traces clobber payload.
+		vec3 hitAlbedo = payload.albedo;
+		float hitEmission = payload.emission;
+		vec3 hitNormal = payload.normal;
+		float hitT = payload.t;
+		vec3 hitPos = origin + direction * hitT;
+		vec3 n = hitNormal;
+		if (dot(n, direction) > 0.0) n = -n;
+
+		if (hitEmission > 0.0) {
+			if (pdfBsdfPrev < 0.0) {
+				radiance += throughput * hitAlbedo * hitEmission;
+			} else if (pdfBsdfPrev > 0.0) {
+				// Glossy BSDF sample landed on the light: MIS weight against the
+				// NEE pdf for hitting this point on the area light.
+				float cosLight = dot(-direction, LIGHT_NORMAL);
+				if (cosLight > 0.0) {
+					float pdfNEE = (hitT * hitT) / (cosLight * LIGHT_AREA);
+					float w = powerHeuristic(pdfBsdfPrev, pdfNEE);
+					radiance += throughput * hitAlbedo * hitEmission * w;
+				} else {
+					radiance += throughput * hitAlbedo * hitEmission;
+				}
+			}
+			// pdfBsdfPrev == 0 (diffuse + NEE): skip — already accounted for.
+			break;
+		}
+
+		// Dielectric glass (sentinel: emission < -10.0, IOR = -emission * 0.1).
+		// Delta lobe: pick reflect vs refract by Schlick Fresnel, no NEE.
+		if (hitEmission < -10.0) {
+			float ior = -hitEmission * 0.1;
+			bool entering = dot(hitNormal, direction) < 0.0;
+			vec3 nFace = entering ? hitNormal : -hitNormal;
+			float eta = entering ? (1.0 / ior) : ior;
+			float cosI = -dot(direction, nFace);
+			float sinT2 = eta * eta * max(0.0, 1.0 - cosI * cosI);
+
+			bool reflectIt;
+			if (sinT2 >= 1.0) {
+				// Total internal reflection.
+				reflectIt = true;
+			} else {
+				float cosT = sqrt(1.0 - sinT2);
+				// Schlick Fresnel for dielectric (use cosI when entering, cosT when exiting).
+				float r0 = (1.0 - ior) / (1.0 + ior);
+				r0 = r0 * r0;
+				float c = entering ? cosI : cosT;
+				float F = r0 + (1.0 - r0) * pow(1.0 - c, 5.0);
+				reflectIt = rnd() < F;
+			}
+
+			if (reflectIt) {
+				direction = reflect(direction, nFace);
+				origin = hitPos + nFace * 0.001;
+			} else {
+				float cosT = sqrt(1.0 - sinT2);
+				direction = normalize(eta * direction + (eta * cosI - cosT) * nFace);
+				origin = hitPos - nFace * 0.001;
+				// Tint transmitted light by albedo on entry. Total tint per slab
+				// traversal = albedo (entry only; exit leaves throughput unchanged).
+				// Clear glass uses albedo = (1,1,1) and this becomes a no-op.
+				if (entering) {
+					throughput *= hitAlbedo;
+				}
+			}
+			// Delta lobe — next emissive hit is counted fully (no MIS).
+			pdfBsdfPrev = -1.0;
+
+			if (bounce >= RR_START_BOUNCE) {
+				float p = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 1.0);
+				if (rnd() > p) break;
+				throughput /= p;
+			}
+			continue;
+		}
+
+		// Metallic glossy GGX (sentinel: emission < -0.5).
+		// Decoded as roughness = -emission - 1.0, clamped to [eps, 1].
+		if (hitEmission < -0.5) {
+			float roughness = clamp(-hitEmission - 1.0, 0.0, 1.0);
+			// --- GGX glossy with NEE + BSDF MIS ---
+			float alpha = max(roughness * roughness, 1e-4); // floor avoids NaN at r→0
+			float alpha2 = alpha * alpha;
+			vec3 F0 = hitAlbedo;
+
+			// View vector (toward camera) and tangent-space basis around n.
+			vec3 V = -direction;
+			mat3 onb = onbFromNormal(n);
+			mat3 onbT = transpose(onb); // world → local
+			vec3 wo = onbT * V;
+			if (wo.z <= 0.0) break; // grazing: numerics break down
+
+			// NEE: sample area light and form a deterministic half-vector.
+			{
+				vec2 lr = vec2(rnd(), rnd());
+				vec3 lightPos = vec3(
+					mix(LIGHT_MIN.x, LIGHT_MAX.x, lr.x),
+					LIGHT_MIN.y,
+					mix(LIGHT_MIN.z, LIGHT_MAX.z, lr.y)
+				);
+				vec3 toLight = lightPos - hitPos;
+				float distSq = dot(toLight, toLight);
+				float dist = sqrt(distSq);
+				vec3 wiW = toLight / dist;
+				float cosSurf  = dot(n, wiW);
+				float cosLight = dot(-wiW, LIGHT_NORMAL);
+
+				if (cosSurf > 0.0 && cosLight > 0.0) {
+					vec3 shadowOrigin = hitPos + n * 0.001;
+					if (visibility(shadowOrigin, wiW, dist - 0.002)) {
+						vec3 wi = onbT * wiW;
+						vec3 wh = normalize(wo + wi);
+						float NoV = wo.z;
+						float NoL = wi.z;
+						float NoH = max(wh.z, 0.0);
+						float VoH = max(dot(wo, wh), 0.0);
+						float D = D_GGX(NoH, alpha2);
+						float G2 = G2_GGX(NoV, NoL, alpha2);
+						vec3 F = F_Schlick(F0, VoH);
+						// f * NoL = D * G2 * F / (4 * NoV)
+						vec3 fcos = D * G2 * F / (4.0 * NoV);
+						float pdfNEE = distSq / (cosLight * LIGHT_AREA);
+						// pdf the BSDF sampler would assign to this same wi (for MIS).
+						float G1 = G1_GGX(NoV, alpha2);
+						float pdfBsdf = G1 * D / (4.0 * NoV);
+						float w = powerHeuristic(pdfNEE, pdfBsdf);
+						radiance += throughput * fcos * LIGHT_EMISSION * w / pdfNEE;
+					}
+				}
+			}
+
+			// BSDF sample via VNDF.
+			vec3 wm = sampleVNDF(wo, alpha, vec2(rnd(), rnd()));
+			vec3 wiL = reflect(-wo, wm);
+			if (wiL.z <= 0.0) break; // sample below horizon
+			float NoV = wo.z;
+			float NoL = wiL.z;
+			float VoH = max(dot(wo, wm), 0.0);
+			vec3 F = F_Schlick(F0, VoH);
+			float G1 = G1_GGX(NoV, alpha2);
+			float G2 = G2_GGX(NoV, NoL, alpha2);
+			// VNDF throughput simplification: f * NoL / pdf = F * (G2 / G1).
+			throughput *= F * (G2 / max(G1, 1e-7));
+
+			// Store pdf for MIS on next emissive hit.
+			float NoH = max(wm.z, 0.0);
+			float D = D_GGX(NoH, alpha2);
+			pdfBsdfPrev = G1 * D / (4.0 * NoV);
+
+			direction = normalize(onb * wiL);
+			origin = hitPos + n * 0.001;
+
+			if (bounce >= RR_START_BOUNCE) {
+				float p = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 1.0);
+				if (rnd() > p) break;
+				throughput /= p;
+			}
+			continue;
+		}
+
+		// --- Next-event estimation: explicit area-light sample (diffuse) ---
+		{
+			vec2 lr = vec2(rnd(), rnd());
+			vec3 lightPos = vec3(
+				mix(LIGHT_MIN.x, LIGHT_MAX.x, lr.x),
+				LIGHT_MIN.y,
+				mix(LIGHT_MIN.z, LIGHT_MAX.z, lr.y)
+			);
+			vec3 toLight = lightPos - hitPos;
+			float distSq = dot(toLight, toLight);
+			float dist = sqrt(distSq);
+			vec3 wi = toLight / dist;
+
+			float cosSurf  = dot(n, wi);
+			float cosLight = dot(-wi, LIGHT_NORMAL);
+
+			if (cosSurf > 0.0 && cosLight > 0.0) {
+				vec3 shadowOrigin = hitPos + n * 0.001;
+				if (visibility(shadowOrigin, wi, dist - 0.002)) {
+					// Lambert BRDF = albedo / PI.
+					// Convert area pdf to solid-angle pdf:
+					//   pdf_omega = distSq / (cosLight * area)
+					// contribution = throughput * (albedo/PI) * cosSurf * Le / pdf_omega
+					vec3 brdf = hitAlbedo * (1.0 / PI);
+					float geom = cosSurf * cosLight / distSq;
+					radiance += throughput * brdf * LIGHT_EMISSION * geom * LIGHT_AREA;
+				}
+			}
+		}
+
+		// Diffuse Lambert bounce. Throughput update for cosine-weighted
+		// sample is just albedo (BRDF * cos / pdf simplifies to albedo).
+		throughput *= hitAlbedo;
+		pdfBsdfPrev = 0.0; // NEE already counted direct light from here.
+
+		// Russian roulette after first few bounces (bias-free).
+		if (bounce >= RR_START_BOUNCE) {
+			float p = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 1.0);
+			if (rnd() > p) break;
+			throughput /= p;
+		}
+
+		vec3 localDir = cosineHemisphere(vec2(rnd(), rnd()));
+		direction = normalize(onbFromNormal(n) * localDir);
+		origin = hitPos + n * 0.001;
+	}
+
+	// Progressive accumulation:  new_avg = (old_avg * n + sample) / (n + 1)
+	vec3 prev = imageLoad(accumImage, ivec2(gl_LaunchIDEXT.xy)).rgb;
+	float n = float(ubo.accumCount);
+	vec3 mixed = (prev * n + radiance) / (n + 1.0);
+	imageStore(accumImage, ivec2(gl_LaunchIDEXT.xy), vec4(mixed, 1.0));
+
+	imageStore(displayImage, ivec2(gl_LaunchIDEXT.xy), vec4(toneMap(mixed), 1.0));
+}
