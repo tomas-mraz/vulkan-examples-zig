@@ -27,6 +27,7 @@ pub fn build(b: *std.Build) void {
     addSpirv(b, exe, "miss_shader", "miss.rmiss");
     addSpirv(b, exe, "closest_hit_shader", "closesthit.rchit");
     addSpirv(b, exe, "remodulate_shader", "remodulate.comp");
+    addSpirv(b, exe, "temporal_reproject_shader", "temporal_reproject.comp");
 
     b.installArtifact(exe);
 

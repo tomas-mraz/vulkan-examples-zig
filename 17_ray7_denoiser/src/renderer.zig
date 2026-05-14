@@ -7,6 +7,7 @@ const raygen_spv align(@alignOf(u32)) = @embedFile("raygen_shader").*;
 const miss_spv align(@alignOf(u32)) = @embedFile("miss_shader").*;
 const closest_hit_spv align(@alignOf(u32)) = @embedFile("closest_hit_shader").*;
 const remodulate_spv align(@alignOf(u32)) = @embedFile("remodulate_shader").*;
+const temporal_reproject_spv align(@alignOf(u32)) = @embedFile("temporal_reproject_shader").*;
 
 const Allocator = std.mem.Allocator;
 const Device = vk.DeviceProxy;
@@ -18,6 +19,7 @@ const vertex_stride_bytes: vk.DeviceSize = floats_per_vertex * @sizeOf(f32);
 const UniformData = extern struct {
     view_inverse: Mat4,
     proj_inverse: Mat4,
+    prev_view_proj: Mat4,
     frame_index: u32,
     accum_count: u32,
     _pad0: u32 = 0,
@@ -100,11 +102,14 @@ pub const Renderer = struct {
     blas: AccelStruct = .{},
     tlas: AccelStruct = .{},
 
-    accum_img: StorageImage = .{},
+    accum_img: StorageImage = .{}, // legacy name; now holds raw 1-SPP demodulated radiance
     display_img: StorageImage = .{},
     gbuf_normal_depth: StorageImage = .{},
     gbuf_motion: StorageImage = .{},
     albedo_img: StorageImage = .{},
+    history_curr: StorageImage = .{},
+    history_prev: StorageImage = .{},
+    gbuf_normal_depth_prev: StorageImage = .{},
 
     uniforms: []Buffer = &.{},
     desc_pool: vk.DescriptorPool = .null_handle,
@@ -113,6 +118,7 @@ pub const Renderer = struct {
     pipeline_layout: vk.PipelineLayout = .null_handle,
     pipeline: vk.Pipeline = .null_handle,
     remodulate_pipeline: vk.Pipeline = .null_handle,
+    temporal_reproject_pipeline: vk.Pipeline = .null_handle,
     sbt: Buffer = .{},
     sbt_raygen_region: vk.StridedDeviceAddressRegionKHR = .{ .stride = 0, .size = 0 },
     sbt_miss_region: vk.StridedDeviceAddressRegionKHR = .{ .stride = 0, .size = 0 },
@@ -123,6 +129,17 @@ pub const Renderer = struct {
     accum_count: u32 = 0,
     prev_view: Mat4 = undefined,
     prev_view_valid: bool = false,
+    prev_view_proj: Mat4 = undefined,
+    prev_view_proj_valid: bool = false,
+
+    // Debug display mode driven by F1..F6 keys:
+    //   0 = final composite (default, F6)
+    //   1 = world-space normal      (F1)
+    //   2 = depth (hitT)            (F2)
+    //   3 = motion vector           (F3)
+    //   4 = primary albedo          (F4)
+    //   5 = demodulated illumination, tonemapped (F5)
+    debug_mode: u32 = 0,
 
     cam_pos: [3]f32 = .{ 0.0, 0.0, 3.0 },
     cam_yaw: f32 = 0.0,
@@ -172,17 +189,22 @@ pub const Renderer = struct {
         try self.createGenericStorageImage(&self.gbuf_normal_depth, extent, .r16g16b16a16_sfloat);
         try self.createGenericStorageImage(&self.gbuf_motion, extent, .r16g16_sfloat);
         try self.createGenericStorageImage(&self.albedo_img, extent, .r8g8b8a8_unorm);
+        try self.createGenericStorageImage(&self.history_curr, extent, .r16g16b16a16_sfloat);
+        try self.createGenericStorageImage(&self.history_prev, extent, .r16g16b16a16_sfloat);
+        try self.createGenericStorageImage(&self.gbuf_normal_depth_prev, extent, .r16g16b16a16_sfloat);
         try self.initImageLayouts();
 
         try self.createUniformBuffers(swap_len);
         try self.createDescriptorSet(swap_len);
         try self.createRtPipeline();
-        try self.createRemodulatePipeline();
+        self.remodulate_pipeline = try self.createComputePipeline(&remodulate_spv);
+        self.temporal_reproject_pipeline = try self.createComputePipeline(&temporal_reproject_spv);
         try self.createShaderBindingTable();
 
         self.frame_index = 0;
         self.accum_count = 0;
         self.prev_view_valid = false;
+        self.prev_view_proj_valid = false;
 
         self.sized_built = true;
     }
@@ -191,6 +213,10 @@ pub const Renderer = struct {
         if (!self.sized_built) return;
         const device = self.device.?;
         self.sbt.deinit(device);
+        if (self.temporal_reproject_pipeline != .null_handle) {
+            device.destroyPipeline(self.temporal_reproject_pipeline, null);
+            self.temporal_reproject_pipeline = .null_handle;
+        }
         if (self.remodulate_pipeline != .null_handle) {
             device.destroyPipeline(self.remodulate_pipeline, null);
             self.remodulate_pipeline = .null_handle;
@@ -216,6 +242,9 @@ pub const Renderer = struct {
         for (self.uniforms) |*ub| ub.deinit(device);
         if (self.uniforms.len != 0) self.allocator.free(self.uniforms);
         self.uniforms = &.{};
+        self.gbuf_normal_depth_prev.deinit(device);
+        self.history_prev.deinit(device);
+        self.history_curr.deinit(device);
         self.albedo_img.deinit(device);
         self.gbuf_motion.deinit(device);
         self.gbuf_normal_depth.deinit(device);
@@ -240,9 +269,16 @@ pub const Renderer = struct {
             self.prev_view_valid = true;
         }
 
+        // Current-frame view*proj. On the very first frame we have no previous
+        // viewProj, so we send the current one (motion ≡ 0, which is correct —
+        // there is no previous frame to reproject from).
+        const view_proj = math.multiply(&proj, &view);
+        const ubo_prev_vp = if (self.prev_view_proj_valid) self.prev_view_proj else view_proj;
+
         const ubo = UniformData{
             .view_inverse = math.invert(view),
             .proj_inverse = math.invert(proj),
+            .prev_view_proj = ubo_prev_vp,
             .frame_index = self.frame_index,
             .accum_count = self.accum_count,
         };
@@ -251,10 +287,6 @@ pub const Renderer = struct {
         const mapped = try device.mapMemory(ub.memory, 0, vk.WHOLE_SIZE, .{});
         @memcpy(@as([*]u8, @ptrCast(@alignCast(mapped)))[0..@sizeOf(UniformData)], std.mem.asBytes(&ubo));
         device.unmapMemory(ub.memory);
-
-        // Sync the accumulation image: previous frame's writes must complete
-        // before this frame's read-modify-write. Layout stays in .general.
-        accumBarrier(device, frame.cmd, self.accum_img.image);
 
         // Display image: contents are fully overwritten by remodulate.comp; just transition to general.
         transitionImage(device, frame.cmd, self.display_img.image, .undefined, .general, .{
@@ -285,29 +317,13 @@ pub const Renderer = struct {
             1,
         );
 
-        // Raygen → remodulate.comp: ensure accumImage and albedoImage writes
-        // are visible to compute reads. Both stay in .general.
+        // Raygen → temporal_reproject.comp: make the rgen outputs (raw demod,
+        // G-buffer, motion, albedo) visible to compute reads. All in .general.
         const rgen_to_comp = [_]vk.ImageMemoryBarrier{
-            .{
-                .src_access_mask = .{ .shader_write_bit = true },
-                .dst_access_mask = .{ .shader_read_bit = true },
-                .old_layout = .general,
-                .new_layout = .general,
-                .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
-                .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
-                .image = self.accum_img.image,
-                .subresource_range = .{ .aspect_mask = .{ .color_bit = true }, .base_mip_level = 0, .level_count = 1, .base_array_layer = 0, .layer_count = 1 },
-            },
-            .{
-                .src_access_mask = .{ .shader_write_bit = true },
-                .dst_access_mask = .{ .shader_read_bit = true },
-                .old_layout = .general,
-                .new_layout = .general,
-                .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
-                .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
-                .image = self.albedo_img.image,
-                .subresource_range = .{ .aspect_mask = .{ .color_bit = true }, .base_mip_level = 0, .level_count = 1, .base_array_layer = 0, .layer_count = 1 },
-            },
+            imageReadBarrierGeneral(self.accum_img.image),
+            imageReadBarrierGeneral(self.albedo_img.image),
+            imageReadBarrierGeneral(self.gbuf_normal_depth.image),
+            imageReadBarrierGeneral(self.gbuf_motion.image),
         };
         device.cmdPipelineBarrier(
             frame.cmd,
@@ -319,8 +335,12 @@ pub const Renderer = struct {
             &rgen_to_comp,
         );
 
-        // Remodulate: × albedo, Reinhard, gamma → display image.
-        device.cmdBindPipeline(frame.cmd, .compute, self.remodulate_pipeline);
+        const group_x: u32 = (frame.extent.width + 7) / 8;
+        const group_y: u32 = (frame.extent.height + 7) / 8;
+
+        // Temporal reproject: blends raw demod with reprojected history into
+        // history_curr.
+        device.cmdBindPipeline(frame.cmd, .compute, self.temporal_reproject_pipeline);
         device.cmdBindDescriptorSets(
             frame.cmd,
             .compute,
@@ -329,8 +349,32 @@ pub const Renderer = struct {
             self.desc_sets[frame.image_index..@intCast(frame.image_index + 1)],
             null,
         );
-        const group_x: u32 = (frame.extent.width + 7) / 8;
-        const group_y: u32 = (frame.extent.height + 7) / 8;
+        device.cmdDispatch(frame.cmd, group_x, group_y, 1);
+
+        // Temporal write of history_curr → remodulate read.
+        const temp_to_remod = [_]vk.ImageMemoryBarrier{
+            imageReadBarrierGeneral(self.history_curr.image),
+        };
+        device.cmdPipelineBarrier(
+            frame.cmd,
+            .{ .compute_shader_bit = true },
+            .{ .compute_shader_bit = true },
+            .{},
+            &.{},
+            &.{},
+            &temp_to_remod,
+        );
+
+        // Remodulate (or debug-view): × albedo, tonemap → display image.
+        device.cmdBindPipeline(frame.cmd, .compute, self.remodulate_pipeline);
+        device.cmdPushConstants(
+            frame.cmd,
+            self.pipeline_layout,
+            .{ .compute_bit = true },
+            0,
+            @sizeOf(u32),
+            @ptrCast(&self.debug_mode),
+        );
         device.cmdDispatch(frame.cmd, group_x, group_y, 1);
 
         transitionImage(device, frame.cmd, self.display_img.image, .general, .transfer_src_optimal, .{
@@ -373,8 +417,62 @@ pub const Renderer = struct {
             .aspect = .{ .color_bit = true },
         });
 
+        // Ping-pong for next frame: history_curr → history_prev, and
+        // gbuf_normal_depth → gbuf_normal_depth_prev. All four images stay in
+        // .general; only access masks change. The barrier covers both the
+        // remaining producer writes (RT for gbuf, compute for history) and
+        // the consumer reads (compute that already happened above).
+        const pingpong_pre = [_]vk.ImageMemoryBarrier{
+            // history_curr: was written by temporal (and read by remodulate);
+            // copying out, so make writes visible to transfer.
+            generalToTransfer(self.history_curr.image, .{ .shader_write_bit = true }, .{ .transfer_read_bit = true }),
+            // history_prev: was read by temporal earlier; we'll overwrite it.
+            // W-after-R: just need execution wait, not flush.
+            generalToTransfer(self.history_prev.image, .{ .shader_read_bit = true }, .{ .transfer_write_bit = true }),
+            // gbuf_normal_depth: written by RT, read by temporal+remodulate;
+            // copying out — flush the write.
+            generalToTransfer(self.gbuf_normal_depth.image, .{ .shader_write_bit = true, .shader_read_bit = true }, .{ .transfer_read_bit = true }),
+            // gbuf_normal_depth_prev: was read by temporal earlier; overwriting.
+            generalToTransfer(self.gbuf_normal_depth_prev.image, .{ .shader_read_bit = true }, .{ .transfer_write_bit = true }),
+        };
+        device.cmdPipelineBarrier(
+            frame.cmd,
+            .{ .ray_tracing_shader_bit_khr = true, .compute_shader_bit = true },
+            .{ .transfer_bit = true },
+            .{},
+            &.{},
+            &.{},
+            &pingpong_pre,
+        );
+
+        const pingpong_copy = vk.ImageCopy{
+            .src_subresource = .{ .aspect_mask = .{ .color_bit = true }, .mip_level = 0, .base_array_layer = 0, .layer_count = 1 },
+            .src_offset = .{ .x = 0, .y = 0, .z = 0 },
+            .dst_subresource = .{ .aspect_mask = .{ .color_bit = true }, .mip_level = 0, .base_array_layer = 0, .layer_count = 1 },
+            .dst_offset = .{ .x = 0, .y = 0, .z = 0 },
+            .extent = .{ .width = frame.extent.width, .height = frame.extent.height, .depth = 1 },
+        };
+        device.cmdCopyImage(
+            frame.cmd,
+            self.history_curr.image,
+            .general,
+            self.history_prev.image,
+            .general,
+            @as([]const vk.ImageCopy, (&pingpong_copy)[0..1]),
+        );
+        device.cmdCopyImage(
+            frame.cmd,
+            self.gbuf_normal_depth.image,
+            .general,
+            self.gbuf_normal_depth_prev.image,
+            .general,
+            @as([]const vk.ImageCopy, (&pingpong_copy)[0..1]),
+        );
+
         self.frame_index +%= 1;
         self.accum_count +%= 1;
+        self.prev_view_proj = view_proj;
+        self.prev_view_proj_valid = true;
     }
 
     // --- FPS-style free camera (WSAD + mouse-look) ---
@@ -391,6 +489,15 @@ pub const Renderer = struct {
         if (window.getKey(.escape) == .press) {
             window.setShouldClose(true);
         }
+
+        // Sticky debug mode — latest pressed F-key wins; nothing pressed
+        // leaves the mode as-is, which is what we want for hold-while-looking.
+        if (window.getKey(.F1) == .press) self.debug_mode = 1;
+        if (window.getKey(.F2) == .press) self.debug_mode = 2;
+        if (window.getKey(.F3) == .press) self.debug_mode = 3;
+        if (window.getKey(.F4) == .press) self.debug_mode = 4;
+        if (window.getKey(.F5) == .press) self.debug_mode = 5;
+        if (window.getKey(.F6) == .press) self.debug_mode = 0;
 
         // Capture cursor lazily so the user can still interact with the window
         // before the first draw lands.
@@ -863,19 +970,24 @@ pub const Renderer = struct {
             .aspect = .{ .color_bit = true },
         });
 
-        // G-buffer images: raygen overwrites them every frame, so a plain
-        // undefined → general transition is enough; no need to clear.
-        const gbuf_targets = [_]vk.Image{
+        // G-buffer + temporal images: each frame either overwrites them
+        // entirely (rgen output, temporal output) or is gated by
+        // accumCount == 0 on the first frame (history/gbuf-prev are never
+        // read on frame 0). Plain undefined → general is enough.
+        const general_targets = [_]vk.Image{
             self.gbuf_normal_depth.image,
             self.gbuf_motion.image,
             self.albedo_img.image,
+            self.history_curr.image,
+            self.history_prev.image,
+            self.gbuf_normal_depth_prev.image,
         };
-        for (gbuf_targets) |img| {
+        for (general_targets) |img| {
             transitionImage(device, cmd, img, .undefined, .general, .{
                 .src_stage = .{ .top_of_pipe_bit = true },
-                .dst_stage = .{ .ray_tracing_shader_bit_khr = true },
+                .dst_stage = .{ .all_commands_bit = true },
                 .src_access = .{},
-                .dst_access = .{ .shader_write_bit = true },
+                .dst_access = .{ .shader_write_bit = true, .shader_read_bit = true, .transfer_read_bit = true, .transfer_write_bit = true },
                 .aspect = .{ .color_bit = true },
             });
         }
@@ -899,7 +1011,6 @@ pub const Renderer = struct {
     fn createDescriptorSet(self: *Renderer, count: usize) !void {
         const device = self.device.?;
 
-        const stage_rgen = vk.ShaderStageFlags{ .raygen_bit_khr = true };
         const stage_rgen_comp = vk.ShaderStageFlags{ .raygen_bit_khr = true, .compute_bit = true };
         const stage_comp = vk.ShaderStageFlags{ .compute_bit = true };
         const stage_rgen_rchit = vk.ShaderStageFlags{ .raygen_bit_khr = true, .closest_hit_bit_khr = true };
@@ -907,15 +1018,18 @@ pub const Renderer = struct {
         const stage_rgen_rchit_rmiss = vk.ShaderStageFlags{ .raygen_bit_khr = true, .closest_hit_bit_khr = true, .miss_bit_khr = true };
 
         const bindings = [_]vk.DescriptorSetLayoutBinding{
-            .{ .binding = 0, .descriptor_type = .acceleration_structure_khr, .descriptor_count = 1, .stage_flags = stage_rgen_rchit },
-            .{ .binding = 1, .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_rgen_comp },
-            .{ .binding = 2, .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_comp },
-            .{ .binding = 3, .descriptor_type = .uniform_buffer, .descriptor_count = 1, .stage_flags = stage_rgen_rchit_rmiss },
-            .{ .binding = 4, .descriptor_type = .storage_buffer, .descriptor_count = 1, .stage_flags = stage_rchit },
-            .{ .binding = 5, .descriptor_type = .storage_buffer, .descriptor_count = 1, .stage_flags = stage_rchit },
-            .{ .binding = 6, .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_rgen },
-            .{ .binding = 7, .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_rgen },
-            .{ .binding = 8, .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_rgen_comp },
+            .{ .binding = 0,  .descriptor_type = .acceleration_structure_khr, .descriptor_count = 1, .stage_flags = stage_rgen_rchit },
+            .{ .binding = 1,  .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_rgen_comp },
+            .{ .binding = 2,  .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_comp },
+            .{ .binding = 3,  .descriptor_type = .uniform_buffer, .descriptor_count = 1, .stage_flags = stage_rgen_rchit_rmiss },
+            .{ .binding = 4,  .descriptor_type = .storage_buffer, .descriptor_count = 1, .stage_flags = stage_rchit },
+            .{ .binding = 5,  .descriptor_type = .storage_buffer, .descriptor_count = 1, .stage_flags = stage_rchit },
+            .{ .binding = 6,  .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_rgen_comp },
+            .{ .binding = 7,  .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_rgen_comp },
+            .{ .binding = 8,  .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_rgen_comp },
+            .{ .binding = 9,  .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_comp },
+            .{ .binding = 10, .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_comp },
+            .{ .binding = 11, .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_comp },
         };
         self.desc_set_layout = try device.createDescriptorSetLayout(&.{
             .binding_count = bindings.len,
@@ -925,7 +1039,7 @@ pub const Renderer = struct {
         const count_u32: u32 = @intCast(count);
         const pool_sizes = [_]vk.DescriptorPoolSize{
             .{ .type = .acceleration_structure_khr, .descriptor_count = count_u32 },
-            .{ .type = .storage_image, .descriptor_count = count_u32 * 5 },
+            .{ .type = .storage_image, .descriptor_count = count_u32 * 8 },
             .{ .type = .uniform_buffer, .descriptor_count = count_u32 },
             .{ .type = .storage_buffer, .descriptor_count = count_u32 * 2 },
         };
@@ -950,6 +1064,9 @@ pub const Renderer = struct {
         const gbuf_normal_depth_info = vk.DescriptorImageInfo{ .sampler = .null_handle, .image_view = self.gbuf_normal_depth.view, .image_layout = .general };
         const gbuf_motion_info = vk.DescriptorImageInfo{ .sampler = .null_handle, .image_view = self.gbuf_motion.view, .image_layout = .general };
         const albedo_info = vk.DescriptorImageInfo{ .sampler = .null_handle, .image_view = self.albedo_img.view, .image_layout = .general };
+        const history_curr_info = vk.DescriptorImageInfo{ .sampler = .null_handle, .image_view = self.history_curr.view, .image_layout = .general };
+        const history_prev_info = vk.DescriptorImageInfo{ .sampler = .null_handle, .image_view = self.history_prev.view, .image_layout = .general };
+        const gbuf_prev_info = vk.DescriptorImageInfo{ .sampler = .null_handle, .image_view = self.gbuf_normal_depth_prev.view, .image_layout = .general };
         const vertex_info = vk.DescriptorBufferInfo{ .buffer = self.vertex_buf.buffer, .offset = 0, .range = vk.WHOLE_SIZE };
         const index_info = vk.DescriptorBufferInfo{ .buffer = self.index_buf.buffer, .offset = 0, .range = vk.WHOLE_SIZE };
 
@@ -961,15 +1078,18 @@ pub const Renderer = struct {
             };
             const ubo_info = vk.DescriptorBufferInfo{ .buffer = self.uniforms[i].buffer, .offset = 0, .range = vk.WHOLE_SIZE };
             const writes = [_]vk.WriteDescriptorSet{
-                .{ .p_next = @ptrCast(&as_info), .dst_set = self.desc_sets[i], .dst_binding = 0, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .acceleration_structure_khr, .p_image_info = undefined, .p_buffer_info = undefined, .p_texel_buffer_view = undefined },
-                .{ .dst_set = self.desc_sets[i], .dst_binding = 1, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_image, .p_image_info = @ptrCast(&accum_info), .p_buffer_info = undefined, .p_texel_buffer_view = undefined },
-                .{ .dst_set = self.desc_sets[i], .dst_binding = 2, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_image, .p_image_info = @ptrCast(&display_info), .p_buffer_info = undefined, .p_texel_buffer_view = undefined },
-                .{ .dst_set = self.desc_sets[i], .dst_binding = 3, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .uniform_buffer, .p_image_info = undefined, .p_buffer_info = @ptrCast(&ubo_info), .p_texel_buffer_view = undefined },
-                .{ .dst_set = self.desc_sets[i], .dst_binding = 4, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_image_info = undefined, .p_buffer_info = @ptrCast(&vertex_info), .p_texel_buffer_view = undefined },
-                .{ .dst_set = self.desc_sets[i], .dst_binding = 5, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_image_info = undefined, .p_buffer_info = @ptrCast(&index_info), .p_texel_buffer_view = undefined },
-                .{ .dst_set = self.desc_sets[i], .dst_binding = 6, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_image, .p_image_info = @ptrCast(&gbuf_normal_depth_info), .p_buffer_info = undefined, .p_texel_buffer_view = undefined },
-                .{ .dst_set = self.desc_sets[i], .dst_binding = 7, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_image, .p_image_info = @ptrCast(&gbuf_motion_info), .p_buffer_info = undefined, .p_texel_buffer_view = undefined },
-                .{ .dst_set = self.desc_sets[i], .dst_binding = 8, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_image, .p_image_info = @ptrCast(&albedo_info), .p_buffer_info = undefined, .p_texel_buffer_view = undefined },
+                .{ .p_next = @ptrCast(&as_info), .dst_set = self.desc_sets[i], .dst_binding = 0,  .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .acceleration_structure_khr, .p_image_info = undefined, .p_buffer_info = undefined, .p_texel_buffer_view = undefined },
+                .{ .dst_set = self.desc_sets[i], .dst_binding = 1,  .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_image,  .p_image_info = @ptrCast(&accum_info),             .p_buffer_info = undefined,           .p_texel_buffer_view = undefined },
+                .{ .dst_set = self.desc_sets[i], .dst_binding = 2,  .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_image,  .p_image_info = @ptrCast(&display_info),           .p_buffer_info = undefined,           .p_texel_buffer_view = undefined },
+                .{ .dst_set = self.desc_sets[i], .dst_binding = 3,  .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .uniform_buffer, .p_image_info = undefined,                         .p_buffer_info = @ptrCast(&ubo_info), .p_texel_buffer_view = undefined },
+                .{ .dst_set = self.desc_sets[i], .dst_binding = 4,  .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_image_info = undefined,                         .p_buffer_info = @ptrCast(&vertex_info), .p_texel_buffer_view = undefined },
+                .{ .dst_set = self.desc_sets[i], .dst_binding = 5,  .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_image_info = undefined,                         .p_buffer_info = @ptrCast(&index_info), .p_texel_buffer_view = undefined },
+                .{ .dst_set = self.desc_sets[i], .dst_binding = 6,  .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_image,  .p_image_info = @ptrCast(&gbuf_normal_depth_info), .p_buffer_info = undefined,           .p_texel_buffer_view = undefined },
+                .{ .dst_set = self.desc_sets[i], .dst_binding = 7,  .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_image,  .p_image_info = @ptrCast(&gbuf_motion_info),       .p_buffer_info = undefined,           .p_texel_buffer_view = undefined },
+                .{ .dst_set = self.desc_sets[i], .dst_binding = 8,  .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_image,  .p_image_info = @ptrCast(&albedo_info),            .p_buffer_info = undefined,           .p_texel_buffer_view = undefined },
+                .{ .dst_set = self.desc_sets[i], .dst_binding = 9,  .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_image,  .p_image_info = @ptrCast(&history_curr_info),      .p_buffer_info = undefined,           .p_texel_buffer_view = undefined },
+                .{ .dst_set = self.desc_sets[i], .dst_binding = 10, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_image,  .p_image_info = @ptrCast(&history_prev_info),      .p_buffer_info = undefined,           .p_texel_buffer_view = undefined },
+                .{ .dst_set = self.desc_sets[i], .dst_binding = 11, .dst_array_element = 0, .descriptor_count = 1, .descriptor_type = .storage_image,  .p_image_info = @ptrCast(&gbuf_prev_info),         .p_buffer_info = undefined,           .p_texel_buffer_view = undefined },
             };
             device.updateDescriptorSets(&writes, null);
         }
@@ -996,11 +1116,17 @@ pub const Renderer = struct {
             .{ .type = .triangles_hit_group_khr, .general_shader = unused, .closest_hit_shader = 2, .any_hit_shader = unused, .intersection_shader = unused },
         };
 
+        // Push-constant range for the remodulate compute shader (debug mode).
+        // RT shaders don't reference it; harmless to expose it via the same
+        // pipeline layout that they share with the compute pipeline.
+        const push_ranges = [_]vk.PushConstantRange{
+            .{ .stage_flags = .{ .compute_bit = true }, .offset = 0, .size = @sizeOf(u32) },
+        };
         self.pipeline_layout = try device.createPipelineLayout(&.{
             .set_layout_count = 1,
             .p_set_layouts = @ptrCast(&self.desc_set_layout),
-            .push_constant_range_count = 0,
-            .p_push_constant_ranges = undefined,
+            .push_constant_range_count = push_ranges.len,
+            .p_push_constant_ranges = &push_ranges,
         }, null);
 
         // Path tracer uses an iterative loop in raygen; only one traceRayEXT
@@ -1026,9 +1152,9 @@ pub const Renderer = struct {
         self.pipeline = pipeline;
     }
 
-    fn createRemodulatePipeline(self: *Renderer) !void {
+    fn createComputePipeline(self: *Renderer, spv: []align(@alignOf(u32)) const u8) !vk.Pipeline {
         const device = self.device.?;
-        const shader = try createShaderModule(device, &remodulate_spv);
+        const shader = try createShaderModule(device, spv);
         defer device.destroyShaderModule(shader, null);
 
         const create_info = vk.ComputePipelineCreateInfo{
@@ -1047,7 +1173,7 @@ pub const Renderer = struct {
             null,
             (&pipeline)[0..1],
         );
-        self.remodulate_pipeline = pipeline;
+        return pipeline;
     }
 
     fn createShaderBindingTable(self: *Renderer) !void {
@@ -1127,16 +1253,36 @@ fn transitionImage(device: Device, cmd: vk.CommandBuffer, image: vk.Image, old_l
     device.cmdPipelineBarrier(cmd, opts.src_stage, opts.dst_stage, .{}, &.{}, &.{}, &.{barrier});
 }
 
-// general → general image barrier guarding ray-tracing read-modify-write of the
-// accumulation image across frames (no layout change, only sync).
-fn accumBarrier(device: Device, cmd: vk.CommandBuffer, image: vk.Image) void {
-    transitionImage(device, cmd, image, .general, .general, .{
-        .src_stage = .{ .ray_tracing_shader_bit_khr = true },
-        .dst_stage = .{ .ray_tracing_shader_bit_khr = true },
-        .src_access = .{ .shader_write_bit = true },
-        .dst_access = .{ .shader_read_bit = true, .shader_write_bit = true },
-        .aspect = .{ .color_bit = true },
-    });
+// .general/W → .general/R image barrier used to chain a producing shader pass
+// (RT or compute) into the next consuming compute pass. Stages are filled in
+// by the caller's cmdPipelineBarrier; this helper just packs the per-image bits.
+fn imageReadBarrierGeneral(image: vk.Image) vk.ImageMemoryBarrier {
+    return .{
+        .src_access_mask = .{ .shader_write_bit = true },
+        .dst_access_mask = .{ .shader_read_bit = true },
+        .old_layout = .general,
+        .new_layout = .general,
+        .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+        .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+        .image = image,
+        .subresource_range = .{ .aspect_mask = .{ .color_bit = true }, .base_mip_level = 0, .level_count = 1, .base_array_layer = 0, .layer_count = 1 },
+    };
+}
+
+// .general → .general barrier carrying the supplied access masks. Used when a
+// storage image needs to flow from a shader pass to a transfer copy (or the
+// other way around) without changing layout.
+fn generalToTransfer(image: vk.Image, src_access: vk.AccessFlags, dst_access: vk.AccessFlags) vk.ImageMemoryBarrier {
+    return .{
+        .src_access_mask = src_access,
+        .dst_access_mask = dst_access,
+        .old_layout = .general,
+        .new_layout = .general,
+        .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+        .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+        .image = image,
+        .subresource_range = .{ .aspect_mask = .{ .color_bit = true }, .base_mip_level = 0, .level_count = 1, .base_array_layer = 0, .layer_count = 1 },
+    };
 }
 
 fn appendBox(

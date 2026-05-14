@@ -404,10 +404,10 @@ paper, code is original GLSL.
 4. **Denoiser — new in 17**
    - [x] G-buffer storage images (normal+depth, motion, albedo) + raygen writes
    - [x] Albedo demodulation in raygen + remodulation in final compute pass
-   - [ ] Previous-frame `viewProj` in UBO + motion-vector math
-   - [ ] Debug F-key cycle through G-buffer outputs (`F1`=normal, `F2`=depth,
-         `F3`=motion, `F4`=albedo, `F5`=noisy 1-SPP, `F6`=denoised)
-   - [ ] `temporal_reproject.comp` — 2×2 bilinear history fetch + per-tap
+   - [x] Previous-frame `viewProj` in UBO + motion-vector math
+   - [x] Debug F-key cycle through G-buffer outputs (`F1`=normal, `F2`=depth,
+         `F3`=motion, `F4`=albedo, `F5`=noisy 1-SPP, `F6`=denoised composite)
+   - [x] `temporal_reproject.comp` — 2×2 bilinear history fetch + per-tap
          disocclusion test + α-blend
    - [ ] `atrous.comp` — single iteration with stride push-constant + 5×5
          B3-spline kernel + edge-stopping weights

@@ -9,6 +9,7 @@ layout(binding = 3, set = 0) uniform CameraProperties
 {
 	mat4 viewInverse;
 	mat4 projInverse;
+	mat4 prevViewProj;
 	uint frameIndex;
 	uint accumCount;
 	uint _pad0;
@@ -181,19 +182,32 @@ void main()
 		// denoiser always has a valid sample, even on primary miss.
 		if (bounce == 0) {
 			ivec2 px = ivec2(gl_LaunchIDEXT.xy);
+			vec2 motionVec = vec2(0.0);
+
 			if (payload.t < 0.0) {
 				imageStore(gbufNormalDepth, px, vec4(0.0, 0.0, 0.0, 1e6));
 				imageStore(albedoImage, px, vec4(0.0, 0.0, 0.0, 1.0));
 				// primaryAlbedo stays white → demod is identity for miss.
+				// motionVec stays 0 — no reliable surface to reproject.
 			} else {
 				vec3 nGB = payload.normal;
 				if (dot(nGB, direction) > 0.0) nGB = -nGB;
 				imageStore(gbufNormalDepth, px, vec4(nGB, payload.t));
 				imageStore(albedoImage, px, vec4(payload.albedo, 1.0));
 				primaryAlbedo = payload.albedo;
+
+				// Reproject the primary-hit world position through last
+				// frame's viewProj to find where the same surface was on
+				// screen one frame ago. motion = currUV - prevUV.
+				vec3 primaryHitPos = origin + direction * payload.t;
+				vec4 prevClip = ubo.prevViewProj * vec4(primaryHitPos, 1.0);
+				if (prevClip.w > 0.0) {
+					vec2 prevNDC = prevClip.xy / prevClip.w;
+					vec2 prevUV  = prevNDC * 0.5 + 0.5;
+					motionVec = inUV - prevUV;
+				}
 			}
-			// TODO: real motion vector once previous-frame viewProj lands in the UBO.
-			imageStore(gbufMotion, px, vec4(0.0, 0.0, 0.0, 0.0));
+			imageStore(gbufMotion, px, vec4(motionVec, 0.0, 0.0));
 		}
 
 		if (payload.t < 0.0) {
@@ -409,18 +423,12 @@ void main()
 		origin = hitPos + n * 0.001;
 	}
 
-	// Demodulate by primary-hit albedo before accumulation — the denoiser
-	// (and accumulator, in this transitional state) operates on the
-	// low-frequency illumination signal so texture/material detail is not
-	// blurred away. ε floor avoids NaN when an albedo channel is 0.
+	// Demodulate by primary-hit albedo. The accumulation is now done by
+	// temporal_reproject.comp, so we just emit raw 1-SPP demodulated
+	// radiance here. ε floor avoids NaN when an albedo channel is 0.
 	vec3 demod = radiance / max(primaryAlbedo, vec3(1e-3));
+	imageStore(accumImage, ivec2(gl_LaunchIDEXT.xy), vec4(demod, 1.0));
 
-	// Progressive accumulation of the demodulated signal:
-	//   new_avg = (old_avg * n + sample) / (n + 1)
-	vec3 prev = imageLoad(accumImage, ivec2(gl_LaunchIDEXT.xy)).rgb;
-	float n = float(ubo.accumCount);
-	vec3 mixed = (prev * n + demod) / (n + 1.0);
-	imageStore(accumImage, ivec2(gl_LaunchIDEXT.xy), vec4(mixed, 1.0));
-
-	// displayImage is now written by remodulate.comp after this raygen pass.
+	// historyCurr (binding 9) and displayImage (binding 2) are written by
+	// the compute passes that follow this raygen.
 }
