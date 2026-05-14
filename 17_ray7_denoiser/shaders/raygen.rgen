@@ -144,13 +144,6 @@ bool visibility(vec3 from, vec3 dir, float dist)
 	return payload.t < 0.0;
 }
 
-// Reinhard tone-map + sRGB-ish gamma encoding.
-vec3 toneMap(vec3 hdr)
-{
-	vec3 mapped = hdr / (vec3(1.0) + hdr);
-	return pow(mapped, vec3(1.0 / 2.2));
-}
-
 void main()
 {
 	rngState = pcg(gl_LaunchIDEXT.x * 1973u + gl_LaunchIDEXT.y * 9277u + ubo.frameIndex * 26699u + 1u);
@@ -170,6 +163,10 @@ void main()
 
 	vec3 throughput = vec3(1.0);
 	vec3 radiance = vec3(0.0);
+	// Primary-hit albedo, captured on bounce 0 and used to demodulate
+	// radiance before accumulation. White default keeps a primary miss
+	// (radiance == 0) divide-safe.
+	vec3 primaryAlbedo = vec3(1.0);
 	// Tracks how to count direct emission on the next emissive hit:
 	//   < 0  : primary ray or delta (mirror) bounce — count fully.
 	//   == 0 : last bounce was diffuse, NEE handled direct light — skip emission.
@@ -187,11 +184,13 @@ void main()
 			if (payload.t < 0.0) {
 				imageStore(gbufNormalDepth, px, vec4(0.0, 0.0, 0.0, 1e6));
 				imageStore(albedoImage, px, vec4(0.0, 0.0, 0.0, 1.0));
+				// primaryAlbedo stays white → demod is identity for miss.
 			} else {
 				vec3 nGB = payload.normal;
 				if (dot(nGB, direction) > 0.0) nGB = -nGB;
 				imageStore(gbufNormalDepth, px, vec4(nGB, payload.t));
 				imageStore(albedoImage, px, vec4(payload.albedo, 1.0));
+				primaryAlbedo = payload.albedo;
 			}
 			// TODO: real motion vector once previous-frame viewProj lands in the UBO.
 			imageStore(gbufMotion, px, vec4(0.0, 0.0, 0.0, 0.0));
@@ -410,11 +409,18 @@ void main()
 		origin = hitPos + n * 0.001;
 	}
 
-	// Progressive accumulation:  new_avg = (old_avg * n + sample) / (n + 1)
+	// Demodulate by primary-hit albedo before accumulation — the denoiser
+	// (and accumulator, in this transitional state) operates on the
+	// low-frequency illumination signal so texture/material detail is not
+	// blurred away. ε floor avoids NaN when an albedo channel is 0.
+	vec3 demod = radiance / max(primaryAlbedo, vec3(1e-3));
+
+	// Progressive accumulation of the demodulated signal:
+	//   new_avg = (old_avg * n + sample) / (n + 1)
 	vec3 prev = imageLoad(accumImage, ivec2(gl_LaunchIDEXT.xy)).rgb;
 	float n = float(ubo.accumCount);
-	vec3 mixed = (prev * n + radiance) / (n + 1.0);
+	vec3 mixed = (prev * n + demod) / (n + 1.0);
 	imageStore(accumImage, ivec2(gl_LaunchIDEXT.xy), vec4(mixed, 1.0));
 
-	imageStore(displayImage, ivec2(gl_LaunchIDEXT.xy), vec4(toneMap(mixed), 1.0));
+	// displayImage is now written by remodulate.comp after this raygen pass.
 }

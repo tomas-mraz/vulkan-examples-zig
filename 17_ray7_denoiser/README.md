@@ -403,7 +403,7 @@ paper, code is original GLSL.
    - [ ] Environment map / HDRI miss shader
 4. **Denoiser — new in 17**
    - [x] G-buffer storage images (normal+depth, motion, albedo) + raygen writes
-   - [ ] Albedo demodulation in raygen + remodulation in final compute pass
+   - [x] Albedo demodulation in raygen + remodulation in final compute pass
    - [ ] Previous-frame `viewProj` in UBO + motion-vector math
    - [ ] Debug F-key cycle through G-buffer outputs (`F1`=normal, `F2`=depth,
          `F3`=motion, `F4`=albedo, `F5`=noisy 1-SPP, `F6`=denoised)

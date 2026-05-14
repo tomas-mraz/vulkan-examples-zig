@@ -6,6 +6,7 @@ const math = ash.math;
 const raygen_spv align(@alignOf(u32)) = @embedFile("raygen_shader").*;
 const miss_spv align(@alignOf(u32)) = @embedFile("miss_shader").*;
 const closest_hit_spv align(@alignOf(u32)) = @embedFile("closest_hit_shader").*;
+const remodulate_spv align(@alignOf(u32)) = @embedFile("remodulate_shader").*;
 
 const Allocator = std.mem.Allocator;
 const Device = vk.DeviceProxy;
@@ -111,6 +112,7 @@ pub const Renderer = struct {
     desc_sets: []vk.DescriptorSet = &.{},
     pipeline_layout: vk.PipelineLayout = .null_handle,
     pipeline: vk.Pipeline = .null_handle,
+    remodulate_pipeline: vk.Pipeline = .null_handle,
     sbt: Buffer = .{},
     sbt_raygen_region: vk.StridedDeviceAddressRegionKHR = .{ .stride = 0, .size = 0 },
     sbt_miss_region: vk.StridedDeviceAddressRegionKHR = .{ .stride = 0, .size = 0 },
@@ -175,6 +177,7 @@ pub const Renderer = struct {
         try self.createUniformBuffers(swap_len);
         try self.createDescriptorSet(swap_len);
         try self.createRtPipeline();
+        try self.createRemodulatePipeline();
         try self.createShaderBindingTable();
 
         self.frame_index = 0;
@@ -188,6 +191,10 @@ pub const Renderer = struct {
         if (!self.sized_built) return;
         const device = self.device.?;
         self.sbt.deinit(device);
+        if (self.remodulate_pipeline != .null_handle) {
+            device.destroyPipeline(self.remodulate_pipeline, null);
+            self.remodulate_pipeline = .null_handle;
+        }
         if (self.pipeline != .null_handle) {
             device.destroyPipeline(self.pipeline, null);
             self.pipeline = .null_handle;
@@ -249,10 +256,10 @@ pub const Renderer = struct {
         // before this frame's read-modify-write. Layout stays in .general.
         accumBarrier(device, frame.cmd, self.accum_img.image);
 
-        // Display image: contents are fully overwritten; just transition to general.
+        // Display image: contents are fully overwritten by remodulate.comp; just transition to general.
         transitionImage(device, frame.cmd, self.display_img.image, .undefined, .general, .{
             .src_stage = .{ .top_of_pipe_bit = true },
-            .dst_stage = .{ .ray_tracing_shader_bit_khr = true },
+            .dst_stage = .{ .compute_shader_bit = true },
             .src_access = .{},
             .dst_access = .{ .shader_write_bit = true },
             .aspect = .{ .color_bit = true },
@@ -278,8 +285,56 @@ pub const Renderer = struct {
             1,
         );
 
+        // Raygen → remodulate.comp: ensure accumImage and albedoImage writes
+        // are visible to compute reads. Both stay in .general.
+        const rgen_to_comp = [_]vk.ImageMemoryBarrier{
+            .{
+                .src_access_mask = .{ .shader_write_bit = true },
+                .dst_access_mask = .{ .shader_read_bit = true },
+                .old_layout = .general,
+                .new_layout = .general,
+                .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+                .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+                .image = self.accum_img.image,
+                .subresource_range = .{ .aspect_mask = .{ .color_bit = true }, .base_mip_level = 0, .level_count = 1, .base_array_layer = 0, .layer_count = 1 },
+            },
+            .{
+                .src_access_mask = .{ .shader_write_bit = true },
+                .dst_access_mask = .{ .shader_read_bit = true },
+                .old_layout = .general,
+                .new_layout = .general,
+                .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+                .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+                .image = self.albedo_img.image,
+                .subresource_range = .{ .aspect_mask = .{ .color_bit = true }, .base_mip_level = 0, .level_count = 1, .base_array_layer = 0, .layer_count = 1 },
+            },
+        };
+        device.cmdPipelineBarrier(
+            frame.cmd,
+            .{ .ray_tracing_shader_bit_khr = true },
+            .{ .compute_shader_bit = true },
+            .{},
+            &.{},
+            &.{},
+            &rgen_to_comp,
+        );
+
+        // Remodulate: × albedo, Reinhard, gamma → display image.
+        device.cmdBindPipeline(frame.cmd, .compute, self.remodulate_pipeline);
+        device.cmdBindDescriptorSets(
+            frame.cmd,
+            .compute,
+            self.pipeline_layout,
+            0,
+            self.desc_sets[frame.image_index..@intCast(frame.image_index + 1)],
+            null,
+        );
+        const group_x: u32 = (frame.extent.width + 7) / 8;
+        const group_y: u32 = (frame.extent.height + 7) / 8;
+        device.cmdDispatch(frame.cmd, group_x, group_y, 1);
+
         transitionImage(device, frame.cmd, self.display_img.image, .general, .transfer_src_optimal, .{
-            .src_stage = .{ .ray_tracing_shader_bit_khr = true },
+            .src_stage = .{ .compute_shader_bit = true },
             .dst_stage = .{ .transfer_bit = true },
             .src_access = .{ .shader_write_bit = true },
             .dst_access = .{ .transfer_read_bit = true },
@@ -845,20 +900,22 @@ pub const Renderer = struct {
         const device = self.device.?;
 
         const stage_rgen = vk.ShaderStageFlags{ .raygen_bit_khr = true };
+        const stage_rgen_comp = vk.ShaderStageFlags{ .raygen_bit_khr = true, .compute_bit = true };
+        const stage_comp = vk.ShaderStageFlags{ .compute_bit = true };
         const stage_rgen_rchit = vk.ShaderStageFlags{ .raygen_bit_khr = true, .closest_hit_bit_khr = true };
         const stage_rchit = vk.ShaderStageFlags{ .closest_hit_bit_khr = true };
         const stage_rgen_rchit_rmiss = vk.ShaderStageFlags{ .raygen_bit_khr = true, .closest_hit_bit_khr = true, .miss_bit_khr = true };
 
         const bindings = [_]vk.DescriptorSetLayoutBinding{
             .{ .binding = 0, .descriptor_type = .acceleration_structure_khr, .descriptor_count = 1, .stage_flags = stage_rgen_rchit },
-            .{ .binding = 1, .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_rgen },
-            .{ .binding = 2, .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_rgen },
+            .{ .binding = 1, .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_rgen_comp },
+            .{ .binding = 2, .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_comp },
             .{ .binding = 3, .descriptor_type = .uniform_buffer, .descriptor_count = 1, .stage_flags = stage_rgen_rchit_rmiss },
             .{ .binding = 4, .descriptor_type = .storage_buffer, .descriptor_count = 1, .stage_flags = stage_rchit },
             .{ .binding = 5, .descriptor_type = .storage_buffer, .descriptor_count = 1, .stage_flags = stage_rchit },
             .{ .binding = 6, .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_rgen },
             .{ .binding = 7, .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_rgen },
-            .{ .binding = 8, .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_rgen },
+            .{ .binding = 8, .descriptor_type = .storage_image, .descriptor_count = 1, .stage_flags = stage_rgen_comp },
         };
         self.desc_set_layout = try device.createDescriptorSetLayout(&.{
             .binding_count = bindings.len,
@@ -967,6 +1024,30 @@ pub const Renderer = struct {
             (&pipeline)[0..1],
         );
         self.pipeline = pipeline;
+    }
+
+    fn createRemodulatePipeline(self: *Renderer) !void {
+        const device = self.device.?;
+        const shader = try createShaderModule(device, &remodulate_spv);
+        defer device.destroyShaderModule(shader, null);
+
+        const create_info = vk.ComputePipelineCreateInfo{
+            .stage = .{
+                .stage = .{ .compute_bit = true },
+                .module = shader,
+                .p_name = "main",
+            },
+            .layout = self.pipeline_layout,
+            .base_pipeline_index = -1,
+        };
+        var pipeline: vk.Pipeline = .null_handle;
+        _ = try device.createComputePipelines(
+            .null_handle,
+            @as([]const vk.ComputePipelineCreateInfo, (&create_info)[0..1]),
+            null,
+            (&pipeline)[0..1],
+        );
+        self.remodulate_pipeline = pipeline;
     }
 
     fn createShaderBindingTable(self: *Renderer) !void {

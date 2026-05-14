@@ -26,6 +26,7 @@ pub fn build(b: *std.Build) void {
     addSpirv(b, exe, "raygen_shader", "raygen.rgen");
     addSpirv(b, exe, "miss_shader", "miss.rmiss");
     addSpirv(b, exe, "closest_hit_shader", "closesthit.rchit");
+    addSpirv(b, exe, "remodulate_shader", "remodulate.comp");
 
     b.installArtifact(exe);
 
